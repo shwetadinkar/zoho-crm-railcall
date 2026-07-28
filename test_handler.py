@@ -405,6 +405,177 @@ def t_convert_lead_with_deal():
     assert out["deal_id"] == "3" and out["deal_name"] == "Big deal", out
 
 
+def _plan_helpers(matched, current, second=None):
+    """COQL twice: caller's query, then the before-values by id."""
+    calls = []
+    seq = [matched, current] + ([second] if second is not None else [])
+
+    def _post(url, obj, **k):
+        calls.append(obj.get("select_query", ""))
+        rows = seq.pop(0) if seq else []
+        return 200, json.dumps({"data": rows}).encode()
+
+    store = {}
+    return {"oauth_refresh": lambda p, **k: {"access_token": "t",
+                                             "instance_url": "https://x"},
+            "http_get_json": lambda u, **k: (200, b"{}"),
+            "http_post_json": _post,
+            "http_delete_json": lambda u, **k: (200, b"{}"),
+            "WS": "/tmp/rc-test",
+            "jload": lambda path, default=None: store.get(path, default if default is not None else {}),
+            "jsave": lambda path, obj: store.__setitem__(path, obj)}, calls
+
+
+def t_plan_update_fingerprints():
+    h, calls = _plan_helpers(
+        [{"id": "1"}, {"id": "2"}],
+        [{"id": "1", "Lead_Status": "New"}, {"id": "2", "Lead_Status": "New"}])
+    m = load(h)
+    out, err = m.zoho_plan_update(
+        {"module": "Leads", "query": "select id from Leads where x = 1",
+         "changes": {"Lead_Status": "Contacted"}}, {})
+    assert err is None
+    assert out["count"] == 2 and out["would_change"] == 2, out
+    assert "apply_update" in out["summary"], out
+    assert len(calls) == 2, calls
+
+
+def t_plan_update_stable_hash():
+    """Same state, same digest, regardless of row order."""
+    h1, _ = _plan_helpers([{"id": "1"}, {"id": "2"}],
+                          [{"id": "1", "S": "a"}, {"id": "2", "S": "b"}])
+    h2, _ = _plan_helpers([{"id": "2"}, {"id": "1"}],
+                          [{"id": "2", "S": "b"}, {"id": "1", "S": "a"}])
+    a = load(h1); b = load(h2)
+    args = {"module": "Leads", "query": "select id from Leads where x=1", "changes": {"S": "z"}}
+    a.zoho_plan_update(args, {}); b.zoho_plan_update(args, {})
+    fa = a._plan_load(a._plan_key("Leads", args["query"], args["changes"]))["fingerprint"]
+    fb = b._plan_load(b._plan_key("Leads", args["query"], args["changes"]))["fingerprint"]
+    assert fa == fb, (fa, fb)
+
+
+def t_plan_update_no_match_raises():
+    h, _ = _plan_helpers([], [])
+    m = load(h)
+    try:
+        m.zoho_plan_update({"module": "Leads", "query": "select id from Leads where x=1",
+                            "changes": {"S": "z"}}, {})
+        assert False
+    except RuntimeError as e:
+        assert "matched no records" in str(e), e
+
+
+def t_plan_update_over_limit():
+    h, _ = _plan_helpers([{"id": str(i)} for i in range(30)], [])
+    m = load(h)
+    try:
+        m.zoho_plan_update({"module": "Leads", "query": "select id from Leads where x=1",
+                            "changes": {"S": "z"}, "max_records": 10}, {})
+        assert False
+    except RuntimeError as e:
+        assert "max_records" in str(e), e
+
+
+def _plan_then_apply(plan_rows, apply_rows, put=None):
+    """One helper dict across both calls so the plan store persists."""
+    calls = []
+    seq = list(plan_rows) + list(apply_rows)
+    store = {}
+
+    def _post(url, obj, **k):
+        calls.append(obj.get("select_query", ""))
+        rows = seq.pop(0) if seq else []
+        return 200, json.dumps({"data": rows}).encode()
+
+    h = {"oauth_refresh": lambda p, **k: {"access_token": "t", "instance_url": "https://x"},
+         "http_get_json": lambda u, **k: (200, b"{}"),
+         "http_post_json": _post,
+         "http_delete_json": lambda u, **k: (200, b"{}"),
+         "WS": "/tmp/rc-test",
+         "jload": lambda path, default=None: store.get(path, default if default is not None else {}),
+         "jsave": lambda path, obj: store.__setitem__(path, obj)}
+    m = load(h)
+    if put:
+        m._put = put
+    return m
+
+
+def t_apply_update_clean():
+    """No drift: the write goes through."""
+    before = [{"id": "1", "S": "a"}, {"id": "2", "S": "b"}]
+    m = _plan_then_apply(
+        [[{"id": "1"}, {"id": "2"}], before],
+        [[{"id": "1"}, {"id": "2"}], before],
+        put=lambda url, obj, hdrs: (200, json.dumps({"data": [
+            {"code": "SUCCESS", "details": {"id": "1"}},
+            {"code": "SUCCESS", "details": {"id": "2"}}]}).encode()))
+    args = {"module": "Leads", "query": "select id from Leads where x=1",
+            "changes": {"S": "z"}}
+    m.zoho_plan_update(args, {})
+    out, err = m.zoho_apply_update(args, {})
+    assert err is None and out["succeeded"] == 2, out
+    assert out["records_applied"] == 2, out
+
+
+def t_apply_without_plan_refuses():
+    m = _plan_then_apply([[{"id": "1"}], [{"id": "1", "S": "a"}]], [])
+    try:
+        m.zoho_apply_update({"module": "Leads",
+                             "query": "select id from Leads where x=1",
+                             "changes": {"S": "z"}}, {})
+        assert False, "applied with no plan"
+    except RuntimeError as e:
+        assert "No current plan" in str(e), e
+
+
+def t_apply_update_detects_drift():
+    """A record edited after planning must block the write."""
+    hit = []
+    m = _plan_then_apply(
+        [[{"id": "1"}, {"id": "2"}], [{"id": "1", "S": "a"}, {"id": "2", "S": "b"}]],
+        [[{"id": "1"}, {"id": "2"}], [{"id": "1", "S": "a"}, {"id": "2", "S": "EDITED"}]],
+        put=lambda url, obj, hdrs: (hit.append(1), (200, b"{}"))[1])
+    args = {"module": "Leads", "query": "select id from Leads where x=1",
+            "changes": {"S": "z"}}
+    m.zoho_plan_update(args, {})
+    try:
+        m.zoho_apply_update(args, {})
+        assert False, "drift not detected"
+    except RuntimeError as e:
+        assert "moved since the plan" in str(e), e
+    assert not hit, "write was attempted despite drift"
+
+
+def t_apply_update_detects_new_match():
+    """A record that newly matches the filter is drift too."""
+    m = _plan_then_apply(
+        [[{"id": "1"}], [{"id": "1", "S": "a"}]],
+        [[{"id": "1"}, {"id": "9"}], [{"id": "1", "S": "a"}, {"id": "9", "S": "new"}]])
+    args = {"module": "Leads", "query": "select id from Leads where x=1",
+            "changes": {"S": "z"}}
+    m.zoho_plan_update(args, {})
+    try:
+        m.zoho_apply_update(args, {})
+        assert False
+    except RuntimeError as e:
+        assert "moved since the plan" in str(e), e
+
+
+
+
+
+def t_apply_update_rejects_junk():
+    h, _ = _plan_helpers([], [])
+    m = load(h)
+    for bad in ({}, {"module": "Leads"},
+                {"module": "Leads", "query": "delete from Leads"}):
+        try:
+            m.zoho_apply_update(bad, {})
+            assert False, "accepted %r" % bad
+        except RuntimeError:
+            pass
+
+
 for name, fn in sorted((k, v) for k, v in list(globals().items())
                        if k.startswith("t_")):
     check(name[2:], fn)
