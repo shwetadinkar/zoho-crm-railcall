@@ -399,5 +399,7 @@
       }
     }
   ],
-  "publisher_pubkey": "be209aad9734a7e3b8b301560bcace329f26c567ca9ef0880fb8358c72ccd761"
+  "publisher_pubkey": "be209aad9734a7e3b8b301560bcace329f26c567ca9ef0880fb8358c72ccd761",
+  "homepage": "https://github.com/shwetadinkar/zoho-crm-railcall",
+  "tests_url": "https://github.com/shwetadinkar/zoho-crm-railcall/blob/main/test_handler.py"
 }
