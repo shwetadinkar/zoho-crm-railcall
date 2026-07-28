@@ -1,4 +1,4 @@
-"""shweta/zoho-crm 0.3.2
+"""shweta/zoho-crm 0.3.5
 
 Vault entry `zoho`:
 
