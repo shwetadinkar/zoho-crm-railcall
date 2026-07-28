@@ -1,9 +1,10 @@
+cat module.json
 {
   "id": "shweta/zoho-crm",
   "name": "zoho-crm",
-  "version": "0.2.4",
+  "version": "0.3.2",
   "provider": "zoho",
-  "description": "Governed Zoho CRM access for small teams and AI agents. Twelve commands across Leads, Contacts, Accounts, Deals and any custom module — every write held behind RailCall's approve-then-execute airlock, every change sealed into a signed receipt.\n\nWHO IT'S FOR: teams too small for a compliance function but regulated enough that 'who changed this client record, and who approved it' is a question they will eventually be asked — an eight-person insurance brokerage, a lending desk, a wealth-advisory practice. Also for anyone giving an AI agent write access to CRM and wanting a preview before it commits.\n\nTHE PROBLEM: CRM has no undo. A wrong filter on a mass update rewrites 400 client records at 6pm and there is no rollback, only a restore request and an awkward week. Zoho Flow and Zapier will both run that automation; neither can stop it, and neither leaves a tamper-evident record of who authorised it.\n\nREAD COMMANDS (no approval needed): verify_connection confirms auth and reports which org and datacenter you are pointed at. describe_module returns every field on a module including custom fields, data types and picklist values — call it first from an agent so writes never guess at field names. search_records runs read-only COQL, Zoho's SQL-like query language, for any 'find the records where...' question. list_records pages through a module. get_record fetches one record by id. list_users returns org users and their ids, which ownership fields require.\n\nWRITE COMMANDS (airlock-gated, preview then approve): create_record and update_record work across any module, batching up to 100 records. upsert_records inserts or updates in place against explicit duplicate-check fields, making re-runs safe. delete_record moves records to the recycle bin, recoverable for 60 days — it never purges. convert_lead turns a qualified Lead into a Contact and Account, optionally opening a Deal. add_note writes an automation's reasoning back onto a record so a human can audit it later.\n\nRELIABILITY: Zoho reports partial failure with HTTP 200, so a batch where 3 of 50 records fail still looks successful to naive tooling. Every write returns succeeded, failed and per-record errors. Rate limits are retried with exponential backoff; writes are never auto-retried after a server error, because Zoho has no idempotency key and a retried create makes duplicates.\n\nQUICK START: create a Self Client at api-console.zoho.com with scopes ZohoCRM.modules.ALL, ZohoCRM.settings.fields.READ and ZohoCRM.users.READ, plus optional ZohoCRM.org.READ, exchange the grant code for a refresh token, then save a vault entry named 'zoho' containing refresh_token, client_id, client_secret, token_url and instance_url. Match the datacenter your org lives in — an Indian org uses accounts.zoho.in and www.zohoapis.in. Run verify_connection first; it tells you immediately whether auth and routing are correct. Secrets stay in the platform vault and are never read from process environment. contest:2026Q3",
+  "description": "Governed Zoho CRM access for small teams and AI agents. Twelve commands across Leads, Contacts, Accounts, Deals and any custom module — every write held behind RailCall's approve-then-execute airlock, every change sealed into a signed receipt.\n\nWHO IT'S FOR: teams too small for a compliance function but regulated enough that 'who changed this client record, and who approved it' is a question they will eventually be asked — an eight-person insurance brokerage, a lending desk, a wealth-advisory practice. Also for anyone giving an AI agent write access to CRM and wanting a preview before it commits.\n\nTHE PROBLEM: CRM has no undo. A wrong filter on a mass update rewrites 400 client records at 6pm and there is no rollback, only a restore request and an awkward week. Zoho Flow and Zapier will both run that automation; neither can stop it, and neither leaves a tamper-evident record of who authorised it.\n\nREADS (no approval): verify_connection confirms auth and reports the org and datacenter. describe_module returns every field including custom ones, data types and picklists, so an agent never guesses at field names. search_records runs read-only COQL. list_records pages through a module, get_record fetches one by id, list_users returns users and the ids ownership fields require.\n\nWRITES (preview then approve): create_record and update_record work across any module, up to 100 records per call. upsert_records inserts or updates in place against explicit duplicate-check fields, so re-runs are safe. delete_record moves to the recycle bin, recoverable 60 days, never purging. convert_lead turns a Lead into a Contact and Account, optionally opening a Deal. add_note writes an automation's reasoning back onto a record.\n\nRELIABILITY: Zoho reports partial failure with HTTP 200, so a batch where 3 of 50 fail still looks successful. Every write returns succeeded, failed and per-record errors. Writes are never auto-retried after a server error, because Zoho has no idempotency key and a retried create duplicates.\n\nQUICK START: create a Self Client at api-console.zoho.com with scopes ZohoCRM.modules.ALL, ZohoCRM.settings.fields.READ, ZohoCRM.users.READ and ZohoCRM.coql.READ, exchange the grant code for a refresh token, then save a vault entry named 'zoho' with refresh_token, client_id, client_secret, token_url and instance_url. Match your org's datacenter: an Indian org uses accounts.zoho.in and www.zohoapis.in. Run verify_connection first. Secrets stay in the vault and are never read from process environment.\n\nDRIFT-SAFE BULK UPDATES: an approval binds to the inputs a human saw, not to the records they point at. Approve a diff over 80 records, someone edits nine while it sits there, and the write lands on state nobody reviewed. plan_update snapshots the fields it will change and fingerprints them; apply_update re-reads, re-hashes, and refuses if anything moved. The snapshot is also the rollback data, since it holds every prior value. contest:2026Q3",
   "commands": [
     {
       "id": "zoho.verify_connection",
@@ -185,6 +186,82 @@
         "users": "array",
         "count": "number"
       }
+    },
+    {
+      "id": "zoho.plan_update",
+      "title": "Plan a bulk update and fingerprint the current state",
+      "provider": "zoho",
+      "risk": "low",
+      "mode": "read_only",
+      "requires": [
+        "ZOHO_OAUTH"
+      ],
+      "preview": false,
+      "receipt_required": true,
+      "input_schema": {
+        "module": {
+          "type": "string",
+          "required": true,
+          "description": "Module API name."
+        },
+        "query": {
+          "type": "string",
+          "required": true,
+          "description": "COQL SELECT picking the records to change. Zoho requires a WHERE clause."
+        },
+        "changes": {
+          "type": "object",
+          "required": true,
+          "description": "Field api_name to new value, applied to every matched record."
+        },
+        "max_records": {
+          "type": "number",
+          "required": false,
+          "description": "Refuse to plan beyond this many records. Max 100."
+        }
+      },
+      "output_schema": {
+        "records": "array",
+        "count": "number",
+        "would_change": "number",
+        "summary": "string"
+      }
+    },
+    {
+      "id": "zoho.apply_update",
+      "title": "Apply a plan, refusing if the records moved since it was made",
+      "provider": "zoho",
+      "risk": "high",
+      "mode": "write_requires_approval",
+      "requires": [
+        "ZOHO_OAUTH"
+      ],
+      "preview": true,
+      "receipt_required": true,
+      "input_schema": {
+        "module": {
+          "type": "string",
+          "required": true,
+          "description": "Module API name, the same one that was planned."
+        },
+        "query": {
+          "type": "string",
+          "required": true,
+          "description": "The same COQL SELECT used for the plan."
+        },
+        "changes": {
+          "type": "object",
+          "required": true,
+          "description": "The same changes object used for the plan."
+        }
+      },
+      "output_schema": {
+        "action": "string",
+        "succeeded": "number",
+        "failed": "number",
+        "records_applied": "number"
+      },
+      "description": "Commit a plan made by zoho.plan_update. Re-runs the query, re-hashes the current state, and refuses the write if anything moved since the plan."
     },
     {
       "id": "zoho.create_record",
@@ -400,6 +477,7 @@
     }
   ],
   "publisher_pubkey": "be209aad9734a7e3b8b301560bcace329f26c567ca9ef0880fb8358c72ccd761",
-  "homepage": "https://github.com/shwetadinkar/zoho-crm-railcall",
-  "tests_url": "https://github.com/shwetadinkar/zoho-crm-railcall/blob/main/test_handler.py"
+  "requires": {
+    "subprocess": false
+  }
 }
