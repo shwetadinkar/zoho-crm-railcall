@@ -1,4 +1,4 @@
-"""shweta/zoho-crm 0.2.2
+"""shweta/zoho-crm 0.3.2
 
 Vault entry `zoho`:
 
@@ -20,6 +20,7 @@ PUT: __rc_helpers__ ships GET, POST, PATCH and DELETE. Zoho's record update
 wants PUT, so _put does that one by hand.
 """
 
+import hashlib
 import json as _json
 import random
 import re
@@ -467,6 +468,218 @@ def zoho_list_users(inputs, stamp):
               "status": u.get("status")} for u in (response.get("users") or [])]
     return {"ok": True, "type": user_type, "users": users,
             "count": len(users)}, None
+
+
+# --- plan / apply -----------------------------------------------------------
+#
+# The airlock binds an approval to the inputs a human saw. It cannot know
+# whether the records those inputs point at changed while the approval was
+# sitting there. On a bulk update that gap matters: you approve a diff over 80
+# records, someone edits nine of them, and the write lands on state nobody
+# reviewed.
+#
+# plan_update snapshots the fields it is about to change and hashes them.
+# apply_update re-reads the same records, re-hashes, and refuses if the hash
+# moved. The snapshot also doubles as the rollback record, since it holds every
+# prior value.
+
+_PLAN_FILE = "zoho_plans.json"
+_PLAN_TTL = 3600  # a plan older than an hour is stale by definition
+
+
+def _plan_key(module, query, changes):
+    """Identify a plan by what it does, not by a token.
+
+    Nothing about a plan can be handed back through a receipt: the platform
+    redacts identifiers before sealing, so ids and hashes come back as
+    '[account]'. Keying on the request itself means apply re-supplies the same
+    module, query and changes a human already approved, and the module looks up
+    its own stored fingerprint.
+    """
+    blob = _json.dumps({"module": module,
+                        "query": " ".join(str(query).lower().split()),
+                        "changes": changes},
+                       sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def _plans_path():
+    helpers = __rc_helpers__  # noqa: F821
+    return str(helpers.get("WS") or "").rstrip("/") + "/" + _PLAN_FILE
+
+
+def _plan_save(key, record):
+    helpers = __rc_helpers__  # noqa: F821
+    path = _plans_path()
+    store = helpers["jload"](path, {}) or {}
+    cutoff = time.time() - _PLAN_TTL
+    store = {k: v for k, v in store.items()
+             if isinstance(v, dict) and float(v.get("ts") or 0) > cutoff}
+    record["ts"] = time.time()
+    store[key] = record
+    helpers["jsave"](path, store)
+
+
+def _plan_load(key):
+    helpers = __rc_helpers__  # noqa: F821
+    store = helpers["jload"](_plans_path(), {}) or {}
+    plan = store.get(key)
+    if not isinstance(plan, dict):
+        return None
+    if time.time() - float(plan.get("ts") or 0) > _PLAN_TTL:
+        return None
+    return plan
+
+
+def _fingerprint(module, rows, fields):
+    """Hash of the current values of just the fields being changed.
+
+    Sorted by id and serialised canonically so the same state always produces
+    the same digest.
+    """
+    snapshot = sorted(
+        [{"id": str(r.get("id")),
+          "before": {f: r.get(f) for f in fields}} for r in rows if r.get("id")],
+        key=lambda x: x["id"])
+    blob = _json.dumps({"module": module, "records": snapshot},
+                       sort_keys=True, separators=(",", ":"), default=str)
+    return "sha256:" + hashlib.sha256(blob.encode("utf-8")).hexdigest(), snapshot
+
+
+def _read_by_ids(module, ids, fields):
+    if not ids:
+        return []
+    columns = ", ".join(fields)
+    id_list = ", ".join(str(i) for i in ids)
+    query = "select %s from %s where id in (%s) limit %d" % (
+        columns, module, id_list, max(len(ids), 1))
+    return _call("POST", "coql", body={"select_query": query}).get("data") or []
+
+
+def zoho_plan_update(inputs, stamp):
+    """Work out what a bulk update would change, without changing anything.
+
+    Returns a plan carrying the prior values and a fingerprint. Feed the plan
+    straight into zoho.apply_update.
+    """
+    module = _module_name(inputs)
+    query = str(inputs.get("query", "")).strip()
+    changes = inputs.get("changes")
+
+    if not query:
+        raise RuntimeError("'query' is required, a COQL SELECT that picks the "
+                           "records to change. Zoho needs a WHERE clause.")
+    if not query.lower().lstrip("( ").startswith("select"):
+        raise RuntimeError("'query' must be a SELECT.")
+    if not isinstance(changes, dict) or not changes:
+        raise RuntimeError("'changes' must be a non-empty object mapping field "
+                           "api_name to the new value.")
+
+    fields = sorted(str(k) for k in changes)
+    bad = [f for f in fields if not f.replace("_", "").isalnum()]
+    if bad:
+        raise RuntimeError("These are not valid field api_names: %r" % bad)
+
+    matched = _call("POST", "coql", body={"select_query": query}).get("data") or []
+    if not matched:
+        raise RuntimeError("The query matched no records, so there is nothing "
+                           "to plan.")
+
+    limit = int(inputs.get("max_records") or 100)
+    if limit > 100:
+        raise RuntimeError("Zoho writes at most 100 records per call, so a plan "
+                           "cannot exceed 100.")
+    if len(matched) > limit:
+        raise RuntimeError(
+            "The query matched %d records but max_records is %d. Narrow the "
+            "query or raise the limit." % (len(matched), limit))
+
+    ids = [str(r.get("id")) for r in matched if r.get("id")]
+    # The caller's query selected whatever it liked. Read the fields we are
+    # actually about to overwrite, so the snapshot covers the right columns.
+    current = _read_by_ids(module, ids, fields)
+    fingerprint, snapshot = _fingerprint(module, current, fields)
+
+    would_change = sum(
+        1 for row in snapshot
+        if any(row["before"].get(f) != changes[f] for f in fields))
+
+    _plan_save(_plan_key(module, query, changes),
+               {"fingerprint": fingerprint, "count": len(snapshot),
+                "records": snapshot})
+
+    return {
+        "ok": True,
+        "module": module,
+        "records": snapshot,
+        "planned_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "count": len(snapshot),
+        "would_change": would_change,
+        "fields": fields,
+        "expires_in_minutes": _PLAN_TTL // 60,
+        "summary": "%d records matched, %d would actually change on %s. Run "
+                   "zoho.apply_update with the same module, query and changes "
+                   "to commit." % (len(snapshot), would_change, ", ".join(fields)),
+    }, None
+
+
+def zoho_apply_update(inputs, stamp):
+    """Re-run the plan's query, and write only if the state still matches.
+
+    Re-supply the same module, query and changes that were planned. The stored
+    fingerprint is looked up locally; nothing has to travel back through a
+    receipt, which matters because the platform redacts identifiers before
+    sealing one. Re-running the query also catches records that newly match the
+    filter, which is drift too.
+    """
+    module = _module_name(inputs)
+    query = str(inputs.get("query", "")).strip()
+    changes = inputs.get("changes")
+    if not query.lower().lstrip("( ").startswith("select"):
+        raise RuntimeError("'query' must be the same COQL SELECT used for the plan.")
+    if not isinstance(changes, dict) or not changes:
+        raise RuntimeError("'changes' must match the plan's changes object.")
+
+    stored = _plan_load(_plan_key(module, query, changes))
+    if not stored:
+        raise RuntimeError(
+            "No current plan for this module, query and changes. Run "
+            "zoho.plan_update first, review what it reports, then apply with "
+            "exactly the same three inputs. Plans expire after %d minutes."
+            % (_PLAN_TTL // 60))
+    expected = str(stored.get("fingerprint") or "")
+
+    fields = sorted(str(k) for k in changes)
+    matched = _call("POST", "coql", body={"select_query": query}).get("data") or []
+    if not matched:
+        raise RuntimeError("The query now matches no records. Something changed "
+                           "since the plan; re-run zoho.plan_update.")
+    if len(matched) > 100:
+        raise RuntimeError("The query now matches %d records, over Zoho's 100 "
+                           "per write." % len(matched))
+
+    ids = [str(r.get("id")) for r in matched if r.get("id")]
+    current = _read_by_ids(module, ids, fields)
+    actual, snapshot = _fingerprint(module, current, fields)
+
+    if actual != expected:
+        raise RuntimeError(
+            "Refusing to apply. The records moved since the plan was made: "
+            "%d now match the query and the state fingerprint is %s, not %s. "
+            "Re-run zoho.plan_update and review the new plan."
+            % (len(snapshot), actual[:23] + "...", expected[:23] + "..."))
+
+    payload = []
+    for row in snapshot:
+        record = {"id": row["id"]}
+        record.update(changes)
+        payload.append(record)
+
+    result = _summarise(_call("PUT", module, body={"data": payload}),
+                        "apply plan to " + module, stamp)
+    result["fingerprint_verified"] = expected
+    result["records_applied"] = len(payload)
+    return result, None
 
 
 # --- writes, all gated by the airlock --------------------------------------
