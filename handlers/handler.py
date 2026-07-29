@@ -1,4 +1,4 @@
-"""shweta/zoho-crm 0.3.5
+"""shweta/zoho-crm 0.5.1
 
 Vault entry `zoho`:
 
@@ -52,16 +52,21 @@ _DEFAULT_FIELDS = {
 
 
 def _origin(stamp):
-    """What initiated this write, copied onto the receipt.
+    """What the airlock told us about this invocation, recorded on every write.
 
-    A receipt saying a record changed is worth less than one saying who or what
-    changed it. The stamp's shape isn't documented, so take whatever keys are
-    there and don't fall over when it's empty.
+    Observed on station v0.40: the stamp is an ISO timestamp string, so this
+    ends up as {"initiated_via": ..., "stamp": "2026-07-29T15:22:15Z"}. That is
+    less than it sounds. It marks a write as having come through the airlock,
+    and nothing here identifies a human apart from an agent, because the
+    platform does not currently pass that. Don't read it as attribution.
+
+    The dict branch stays because the stamp is undocumented and may be enriched
+    later; if it is, the extra keys land in the receipt without a code change.
     """
     info = {"initiated_via": "railcall-airlock"}
     if isinstance(stamp, dict):
-        for key in ("actor", "agent", "origin", "source", "initiated_by",
-                    "approved_by", "run_id", "trace_id", "ts", "timestamp"):
+        for key in ("actor", "agent", "origin", "initiated_by", "approved_by",
+                    "run_id", "trace_id", "timestamp"):
             value = stamp.get(key)
             if value not in (None, "", [], {}):
                 info[key] = value
@@ -76,15 +81,30 @@ def _auth():
     oauth_refresh does the minting, caching and clock skew. Don't reimplement it.
     """
     helpers = __rc_helpers__  # noqa: F821
-    token = helpers["oauth_refresh"]("zoho")
+    try:
+        token = helpers["oauth_refresh"]("zoho")
+    except Exception as error:
+        raise RuntimeError(
+            "Could not get a Zoho access token: %s\n\n"
+            "The vault needs an entry named 'zoho' shaped like this, with the "
+            "URLs matching your org's datacenter:\n"
+            '  {"refresh_token": "1000....",\n'
+            '   "client_id":     "1000....",\n'
+            '   "client_secret": "....",\n'
+            '   "token_url":     "https://accounts.zoho.in/oauth/v2/token",\n'
+            '   "instance_url":  "https://www.zohoapis.in"}\n\n'
+            "Swap .in for .com, .eu, .com.au, .jp, .ca or .sa as appropriate. "
+            "A token minted in one datacenter will not work against another."
+            % error)
     access = str(token.get("access_token") or "").strip()
     if not access:
         raise RuntimeError("zoho oauth_refresh returned no access_token")
     base = str(token.get("instance_url") or "").strip().rstrip("/")
     if not base:
         raise RuntimeError(
-            "zoho vault entry has no instance_url. Set it to your datacenter's "
-            "API host, e.g. https://www.zohoapis.in for an Indian org.")
+            "The zoho vault entry has no instance_url. Set it to your "
+            "datacenter's API host, for example https://www.zohoapis.in for an "
+            "Indian org or https://www.zohoapis.com for a US one.")
     return access, base, {"Authorization": "Zoho-oauthtoken " + access}
 
 
@@ -322,50 +342,87 @@ def _resolve_fields(module, requested):
 
 # --- reads -----------------------------------------------------------------
 
-def zoho_verify_connection(inputs, stamp):
-    """Prove the token works and say what we can see.
+_SCOPE_PROBES = [
+    # scope, what it gates, how to prove it, whether the module needs it
+    ("ZohoCRM.settings.fields.READ", ["describe_module", "list_records"],
+     ("GET", "settings/fields", {"module": "Leads"}), True),
+    ("ZohoCRM.modules.ALL", ["everything that reads or writes records"],
+     ("GET", "Leads", {"fields": "Last_Name", "per_page": 1}), True),
+    ("ZohoCRM.coql.READ", ["search_records", "plan_update", "plan_delete",
+                           "plan_handover", "and every apply_"],
+     ("COQL", "select Last_Name from Leads where Last_Name is not null limit 1", None), True),
+    ("ZohoCRM.users.READ", ["list_users", "plan_handover", "apply_handover"],
+     ("GET", "users", {"type": "CurrentUser"}), True),
+    ("ZohoCRM.org.READ", ["org details on verify_connection"],
+     ("GET", "org", None), False),
+]
 
-    Probes a scope the module already needs, so it can't fail on an optional
-    one. Org details want ZohoCRM.org.READ; without it this still succeeds and
-    says why the org fields are blank.
-    """
-    _, base, _ = _auth()
 
-    probe = _call("GET", "settings/fields", params={"module": "Leads"})
-    field_count = len(probe.get("fields") or [])
-
-    org_name = org_id = country = primary_email = ""
-    org_note = ""
+def _probe(kind, path, params):
+    """Run one capability probe. Returns (ok, detail)."""
     try:
-        response = _call("GET", "org")
-        orgs = response.get("org", []) or []
-        if orgs:
-            org = orgs[0]
-            org_name = org.get("company_name") or ""
-            org_id = str(org.get("id") or "")
-            country = org.get("country") or ""
-            primary_email = org.get("primary_email") or ""
+        if kind == "COQL":
+            _call("POST", "coql", body={"select_query": path})
         else:
-            org_note = "Zoho returned no org record."
+            _call(kind, path, params=params)
+        return True, ""
     except RuntimeError as error:
         text = str(error)
         if "OAUTH_SCOPE_MISMATCH" in text or "HTTP 401" in text:
-            org_note = ("org details unavailable, token lacks the optional "
-                        "ZohoCRM.org.READ scope. Auth itself is fine.")
-        else:
-            raise
+            return False, "scope not granted"
+        return False, text[:120]
+
+
+def zoho_verify_connection(inputs, stamp):
+    """Preflight. Checks every scope this module needs and says what is missing.
+
+    Run this first. A missing scope otherwise shows up much later as an
+    unrelated command failing with a bare 401, which is the single most
+    expensive way to discover a setup problem.
+    """
+    _, base, _ = _auth()
+
+    scopes, blocked, missing_required = {}, [], []
+    for scope, gates, (kind, path, params), required in _SCOPE_PROBES:
+        ok, detail = _probe(kind, path, params)
+        scopes[scope] = "ok" if ok else (
+            "MISSING" if required else "missing (optional)")
+        if not ok:
+            if required:
+                missing_required.append(scope)
+                blocked.extend(gates)
+            elif detail and detail != "scope not granted":
+                scopes[scope] = "error: " + detail
+
+    org_name = org_id = country = ""
+    if scopes.get("ZohoCRM.org.READ") == "ok":
+        orgs = (_call("GET", "org").get("org") or [{}])
+        org_name = orgs[0].get("company_name") or ""
+        org_id = str(orgs[0].get("id") or "")
+        country = orgs[0].get("country") or ""
+
+    ready = not missing_required
+    if ready:
+        summary = ("Ready. All required scopes granted on %s%s."
+                   % (base, " for " + org_name if org_name else ""))
+    else:
+        summary = ("Not ready. Missing %s. Re-mint the refresh token in the "
+                   "Zoho API console with the full scope list from the README. "
+                   "Until then these will fail: %s."
+                   % (", ".join(missing_required), ", ".join(sorted(set(blocked)))))
 
     return {
         "ok": True,
+        "ready": ready,
         "authenticated": True,
         "api_domain": base,
         "api_version": API_VERSION,
-        "leads_field_count": field_count,
+        "scopes": scopes,
+        "blocked_commands": sorted(set(blocked)),
         "org_name": org_name,
         "org_id": org_id,
         "country": country,
-        "primary_email": primary_email,
-        "note": org_note,
+        "summary": summary,
     }, None
 
 
@@ -546,14 +603,56 @@ def _fingerprint(module, rows, fields):
     return "sha256:" + hashlib.sha256(blob.encode("utf-8")).hexdigest(), snapshot
 
 
+# Snapshotted before a bulk delete. If a record was touched since the plan,
+# Modified_Time moves and the fingerprint stops matching.
+_DELETE_GUARD_FIELDS = ["Modified_Time"]
+
+_COQL_PAGE = 200          # Zoho's per-call ceiling
+_SCAN_CAP = 2000          # refuse past this rather than half-report
+
+
+def _strip_limit(query):
+    """Remove a trailing LIMIT so _coql_all can page the same query.
+
+    Callers write natural COQL with a limit; paging needs to control it.
+    """
+    return re.sub(r"\s+limit\s+\d+(\s*,\s*\d+)?\s*$", "", str(query).strip(),
+                  flags=re.I)
+
+
+def _coql_all(base_query, cap=_SCAN_CAP, label="query"):
+    """Run a SELECT to completion instead of taking the first page.
+
+    Zoho returns at most 200 rows per call and flags more_records. Reading one
+    page and calling it the answer is how a handover reports 200 records,
+    moves 200, and quietly leaves the other 140 behind. Anything that claims a
+    set is complete has to page.
+
+    `base_query` must have no LIMIT of its own; this appends one.
+    """
+    rows, offset = [], 0
+    while True:
+        page_q = "%s limit %d, %d" % (base_query, offset, _COQL_PAGE)
+        response = _call("POST", "coql", body={"select_query": page_q})
+        page = response.get("data") or []
+        rows.extend(page)
+        if len(rows) > cap:
+            raise RuntimeError(
+                "%s matches more than %d records. Narrow it rather than acting "
+                "on a partial set; a half-complete result here is worse than an "
+                "error." % (label, cap))
+        if not (response.get("info") or {}).get("more_records"):
+            return rows
+        offset += _COQL_PAGE
+
+
 def _read_by_ids(module, ids, fields):
     if not ids:
         return []
     columns = ", ".join(fields)
     id_list = ", ".join(str(i) for i in ids)
-    query = "select %s from %s where id in (%s) limit %d" % (
-        columns, module, id_list, max(len(ids), 1))
-    return _call("POST", "coql", body={"select_query": query}).get("data") or []
+    return _coql_all("select %s from %s where id in (%s)" % (columns, module, id_list),
+                     cap=len(ids) + _COQL_PAGE, label="id lookup on " + module)
 
 
 def zoho_plan_update(inputs, stamp):
@@ -580,7 +679,7 @@ def zoho_plan_update(inputs, stamp):
     if bad:
         raise RuntimeError("These are not valid field api_names: %r" % bad)
 
-    matched = _call("POST", "coql", body={"select_query": query}).get("data") or []
+    matched = _coql_all(_strip_limit(query), cap=200, label="plan query")
     if not matched:
         raise RuntimeError("The query matched no records, so there is nothing "
                            "to plan.")
@@ -640,6 +739,14 @@ def zoho_apply_update(inputs, stamp):
     if not isinstance(changes, dict) or not changes:
         raise RuntimeError("'changes' must match the plan's changes object.")
 
+    # Field names are interpolated into COQL by _read_by_ids, so validate before
+    # anything else. plan_update checks them too; the plan lookup below happens
+    # to block a bad name today, but that is incidental and a refactor could
+    # remove it.
+    bad = [f for f in changes if not str(f).replace("_", "").isalnum()]
+    if bad:
+        raise RuntimeError("These are not valid field api_names: %r" % bad)
+
     stored = _plan_load(_plan_key(module, query, changes))
     if not stored:
         raise RuntimeError(
@@ -650,7 +757,7 @@ def zoho_apply_update(inputs, stamp):
     expected = str(stored.get("fingerprint") or "")
 
     fields = sorted(str(k) for k in changes)
-    matched = _call("POST", "coql", body={"select_query": query}).get("data") or []
+    matched = _coql_all(_strip_limit(query), cap=200, label="apply query")
     if not matched:
         raise RuntimeError("The query now matches no records. Something changed "
                            "since the plan; re-run zoho.plan_update.")
@@ -680,6 +787,280 @@ def zoho_apply_update(inputs, stamp):
     result["fingerprint_verified"] = expected
     result["records_applied"] = len(payload)
     return result, None
+
+
+def zoho_plan_delete(inputs, stamp):
+    """Work out what a bulk delete would remove, without removing anything.
+
+    Snapshots Modified_Time on every match. If a record is touched between the
+    plan and the approval, the fingerprint moves and apply_delete refuses.
+    Deleting is the one write where reviewing a stale set matters most, so it
+    gets the same treatment as an update.
+    """
+    module = _module_name(inputs)
+    query = str(inputs.get("query", "")).strip()
+    if not query.lower().lstrip("( ").startswith("select"):
+        raise RuntimeError("'query' is required, a COQL SELECT picking the "
+                           "records to delete. Zoho needs a WHERE clause.")
+
+    matched = _coql_all(_strip_limit(query), cap=100, label="delete plan query")
+    if not matched:
+        raise RuntimeError("The query matched no records, so there is nothing "
+                           "to delete.")
+
+    ids = [str(r.get("id")) for r in matched if r.get("id")]
+    current = _read_by_ids(module, ids, _DELETE_GUARD_FIELDS)
+    fingerprint, snapshot = _fingerprint(module, current, _DELETE_GUARD_FIELDS)
+    _plan_save(_plan_key("delete:" + module, query, {}),
+               {"fingerprint": fingerprint, "count": len(snapshot)})
+
+    return {
+        "ok": True,
+        "module": module,
+        "count": len(snapshot),
+        "records": snapshot,
+        "expires_in_minutes": _PLAN_TTL // 60,
+        "summary": "%d records in %s would go to the recycle bin, recoverable "
+                   "for 60 days. Run zoho.apply_delete with the same module and "
+                   "query to commit." % (len(snapshot), module),
+    }, None
+
+
+def zoho_apply_delete(inputs, stamp):
+    """Commit a delete plan, refusing if any record moved since it was made."""
+    module = _module_name(inputs)
+    query = str(inputs.get("query", "")).strip()
+    if not query.lower().lstrip("( ").startswith("select"):
+        raise RuntimeError("'query' must be the same COQL SELECT used for the "
+                           "plan.")
+
+    stored = _plan_load(_plan_key("delete:" + module, query, {}))
+    if not stored:
+        raise RuntimeError(
+            "No current plan for this delete. Run zoho.plan_delete first, "
+            "review what it reports, then apply with the same module and query. "
+            "Plans expire after %d minutes." % (_PLAN_TTL // 60))
+
+    matched = _coql_all(_strip_limit(query), cap=100, label="delete apply query")
+    if not matched:
+        raise RuntimeError("The query now matches no records. Something changed "
+                           "since the plan; re-run zoho.plan_delete.")
+
+    ids = [str(r.get("id")) for r in matched if r.get("id")]
+    current = _read_by_ids(module, ids, _DELETE_GUARD_FIELDS)
+    actual, snapshot = _fingerprint(module, current, _DELETE_GUARD_FIELDS)
+
+    if actual != stored.get("fingerprint"):
+        raise RuntimeError(
+            "Refusing to delete. The records moved since the plan was made: %d "
+            "now match and the state fingerprint no longer agrees. Re-run "
+            "zoho.plan_delete and review the new set." % len(snapshot))
+
+    response = _call("DELETE", module,
+                     params={"ids": ",".join(r["id"] for r in snapshot)})
+    result = _summarise(response, "apply delete plan to " + module, stamp)
+    result["records_deleted"] = len(snapshot)
+    return result, None
+
+
+# --- handover ---------------------------------------------------------------
+#
+# When someone leaves, their open pipeline has to move to whoever picks it up,
+# and somebody has to be able to show it moved completely. That is usually an
+# afternoon of manual reassignment across four modules with no record of what
+# happened. Same plan/apply shape as above: snapshot, fingerprint, re-verify,
+# then one approved write per module.
+
+_HANDOVER_MODULES = ["Leads", "Deals", "Contacts", "Accounts"]
+_CLOSED_STAGES = ("Closed Won", "Closed Lost", "Closed-Lost to Competition")
+
+
+def _handover_modules(inputs):
+    requested = inputs.get("modules")
+    if requested is None:
+        return list(_HANDOVER_MODULES)
+    if not isinstance(requested, list) or not requested:
+        raise RuntimeError("'modules' must be a non-empty array of module "
+                           "api_names, or omitted for %s."
+                           % ", ".join(_HANDOVER_MODULES))
+    out = [str(m).strip() for m in requested]
+    bad = [m for m in out if not m.replace("_", "").isalnum()]
+    if bad:
+        raise RuntimeError("Not valid module api_names: %r" % bad)
+    return out
+
+
+def _owned_query(module, user_id, include_closed):
+    """Records in one module owned by a user.
+
+    Deals get a stage filter unless closed ones were asked for. Reassigning
+    closed business rewrites who is credited with it, which is rarely what
+    someone means by handover.
+
+    The stage filter is one NOT IN rather than chained != conditions. Zoho's
+    COQL parser rejects three of those on the same column with a bare
+    SYNTAX_ERROR near 'where'.
+    """
+    where = "Owner = '%s'" % user_id
+    if module == "Deals" and not include_closed:
+        stages = ", ".join("'%s'" % s for s in _CLOSED_STAGES)
+        where += " and Stage not in (%s)" % stages
+    return "select Owner from %s where %s" % (module, where)
+
+
+def _resolve_user(users, who, label):
+    who = str(who or "").strip()
+    if not who:
+        raise RuntimeError("'%s' is required: a Zoho user id, or the exact "
+                           "email or full name of a user." % label)
+    for u in users:
+        if str(u.get("id")) == who:
+            return u
+    hits = [u for u in users
+            if who.lower() in (str(u.get("email") or "") + " "
+                               + str(u.get("full_name") or "")).lower()]
+    if len(hits) == 1:
+        return hits[0]
+    if not hits:
+        raise RuntimeError("No active user matches %r for '%s'. Run "
+                           "zoho.list_users to see who is available."
+                           % (who, label))
+    raise RuntimeError("%r matches %d users for '%s'. Use the user id instead."
+                       % (who, len(hits), label))
+
+
+def _handover_scan(module_names, from_id, include_closed):
+    """Per-module id lists for everything the leaver owns."""
+    found = {}
+    for module in module_names:
+        rows = _coql_all(_owned_query(module, from_id, include_closed),
+                         label="ownership scan on " + module)
+        found[module] = [str(r.get("id")) for r in rows if r.get("id")]
+    return found
+
+
+def _handover_fingerprint(found):
+    blob = _json.dumps({m: sorted(ids) for m, ids in found.items()},
+                       sort_keys=True, separators=(",", ":"))
+    return "sha256:" + hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def zoho_plan_handover(inputs, stamp):
+    """Work out what a departing user owns, without moving anything."""
+    users = (_call("GET", "users",
+                   params={"type": "ActiveConfirmedUsers", "per_page": 200})
+             .get("users") or [])
+    leaver = _resolve_user(users, inputs.get("from_user"), "from_user")
+    taker = _resolve_user(users, inputs.get("to_user"), "to_user")
+    if str(leaver.get("id")) == str(taker.get("id")):
+        raise RuntimeError("from_user and to_user are the same person.")
+
+    closed = str(inputs.get("closed_deals") or "skip").strip().lower()
+    if closed not in ("skip", "include"):
+        raise RuntimeError("'closed_deals' must be 'skip' or 'include'.")
+    include_closed = closed == "include"
+
+    module_names = _handover_modules(inputs)
+    found = _handover_scan(module_names, str(leaver["id"]), include_closed)
+    total = sum(len(v) for v in found.values())
+    if not total:
+        raise RuntimeError("%s owns nothing in %s, so there is nothing to hand "
+                           "over." % (leaver.get("full_name"),
+                                      ", ".join(module_names)))
+
+    excluded = 0
+    if "Deals" in module_names and not include_closed:
+        every = _handover_scan(["Deals"], str(leaver["id"]), True)["Deals"]
+        excluded = max(0, len(every) - len(found.get("Deals", [])))
+
+    fingerprint = _handover_fingerprint(found)
+    _plan_save(_plan_key("handover", str(leaver["id"]) + ">" + str(taker["id"]),
+                         {"modules": module_names, "closed": closed}),
+               {"fingerprint": fingerprint, "count": total,
+                "found": {m: len(v) for m, v in found.items()}})
+
+    breakdown = ", ".join("%d %s" % (len(found[m]), m.lower())
+                          for m in module_names if found.get(m))
+    note = ""
+    if excluded:
+        note = " %d closed deals were excluded; re-run with closed_deals=include to move them." % excluded
+
+    return {
+        "ok": True,
+        "from_user": leaver.get("full_name"),
+        "to_user": taker.get("full_name"),
+        "modules": module_names,
+        "counts": {m: len(v) for m, v in found.items()},
+        "total": total,
+        "closed_deals_excluded": excluded,
+        "expires_in_minutes": _PLAN_TTL // 60,
+        "summary": "%s owns %s (%d records) to move to %s.%s"
+                   % (leaver.get("full_name"), breakdown, total,
+                      taker.get("full_name"), note),
+    }, None
+
+
+def zoho_apply_handover(inputs, stamp):
+    """Reassign everything in the plan, refusing if the set changed."""
+    users = (_call("GET", "users",
+                   params={"type": "ActiveConfirmedUsers", "per_page": 200})
+             .get("users") or [])
+    leaver = _resolve_user(users, inputs.get("from_user"), "from_user")
+    taker = _resolve_user(users, inputs.get("to_user"), "to_user")
+
+    closed = str(inputs.get("closed_deals") or "skip").strip().lower()
+    if closed not in ("skip", "include"):
+        raise RuntimeError("'closed_deals' must be 'skip' or 'include'.")
+    module_names = _handover_modules(inputs)
+
+    stored = _plan_load(_plan_key("handover",
+                                  str(leaver["id"]) + ">" + str(taker["id"]),
+                                  {"modules": module_names, "closed": closed}))
+    if not stored:
+        raise RuntimeError(
+            "No current plan for this handover. Run zoho.plan_handover first, "
+            "review what it reports, then apply with the same inputs. Plans "
+            "expire after %d minutes." % (_PLAN_TTL // 60))
+
+    found = _handover_scan(module_names, str(leaver["id"]), closed == "include")
+    if _handover_fingerprint(found) != stored.get("fingerprint"):
+        now = {m: len(v) for m, v in found.items()}
+        raise RuntimeError(
+            "Refusing to hand over. What %s owns changed since the plan was "
+            "made: now %s, planned %s. Re-run zoho.plan_handover."
+            % (leaver.get("full_name"), now, stored.get("found")))
+
+    owner = {"Owner": {"id": str(taker["id"])}}
+    moved, failed, errors = 0, 0, []
+    for module, ids in found.items():
+        for start in range(0, len(ids), 100):
+            batch = ids[start:start + 100]
+            if not batch:
+                continue
+            payload = [dict(owner, id=rid) for rid in batch]
+            result = _call("PUT", module, body={"data": payload})
+            for row in result.get("data", []) or []:
+                if row.get("code") == "SUCCESS":
+                    moved += 1
+                else:
+                    failed += 1
+                    errors.append({"module": module, "code": row.get("code"),
+                                   "message": row.get("message")})
+
+    if moved == 0 and failed:
+        raise RuntimeError("Zoho rejected every reassignment. First error: %s"
+                           % errors[0])
+
+    return {
+        "ok": True,
+        "action": "handover %s to %s" % (leaver.get("full_name"),
+                                         taker.get("full_name")),
+        "moved": moved,
+        "failed": failed,
+        "per_module": {m: len(v) for m, v in found.items()},
+        "errors": errors[:10],
+        "origin": _origin(stamp),
+    }, None
 
 
 # --- writes, all gated by the airlock --------------------------------------
