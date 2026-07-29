@@ -1,14 +1,34 @@
-cat module.json
 {
   "id": "shweta/zoho-crm",
   "name": "zoho-crm",
-  "version": "0.3.5",
+  "version": "0.5.1",
   "provider": "zoho",
-  "description": "Governed Zoho CRM access for small teams and AI agents. Twelve commands across Leads, Contacts, Accounts, Deals and any custom module — every write held behind RailCall's approve-then-execute airlock, every change sealed into a signed receipt.\n\nWHO IT'S FOR: teams too small for a compliance function but regulated enough that 'who changed this client record, and who approved it' is a question they will eventually be asked — an eight-person insurance brokerage, a lending desk, a wealth-advisory practice. Also for anyone giving an AI agent write access to CRM and wanting a preview before it commits.\n\nTHE PROBLEM: CRM has no undo. A wrong filter on a mass update rewrites 400 client records at 6pm and there is no rollback, only a restore request and an awkward week. Zoho Flow and Zapier will both run that automation; neither can stop it, and neither leaves a tamper-evident record of who authorised it.\n\nREADS (no approval): verify_connection confirms auth and reports the org and datacenter. describe_module returns every field including custom ones, data types and picklists, so an agent never guesses at field names. search_records runs read-only COQL. list_records pages through a module, get_record fetches one by id, list_users returns users and the ids ownership fields require.\n\nWRITES (preview then approve): create_record and update_record work across any module, up to 100 records per call. upsert_records inserts or updates in place against explicit duplicate-check fields, so re-runs are safe. delete_record moves to the recycle bin, recoverable 60 days, never purging. convert_lead turns a Lead into a Contact and Account, optionally opening a Deal. add_note writes an automation's reasoning back onto a record.\n\nRELIABILITY: Zoho reports partial failure with HTTP 200, so a batch where 3 of 50 fail still looks successful. Every write returns succeeded, failed and per-record errors. Writes are never auto-retried after a server error, because Zoho has no idempotency key and a retried create duplicates.\n\nQUICK START: create a Self Client at api-console.zoho.com with scopes ZohoCRM.modules.ALL, ZohoCRM.settings.fields.READ, ZohoCRM.users.READ and ZohoCRM.coql.READ, exchange the grant code for a refresh token, then save a vault entry named 'zoho' with refresh_token, client_id, client_secret, token_url and instance_url. Match your org's datacenter: an Indian org uses accounts.zoho.in and www.zohoapis.in. Run verify_connection first. Secrets stay in the vault and are never read from process environment.\n\nDRIFT-SAFE BULK UPDATES: an approval binds to the inputs a human saw, not to the records they point at. Approve a diff over 80 records, someone edits nine while it sits there, and the write lands on state nobody reviewed. plan_update snapshots the fields it will change and fingerprints them; apply_update re-reads, re-hashes, and refuses if anything moved. The snapshot is also the rollback data, since it holds every prior value. contest:2026Q3",
+  "homepage": "https://github.com/shwetadinkar/zoho-crm-railcall/blob/main/COMMANDS.md",
+  "tests_url": "https://github.com/shwetadinkar/zoho-crm-railcall/blob/main/test_handler.py",
+  "description": "Governed Zoho CRM for small teams and AI agents. Eighteen commands across Leads, Contacts, Accounts, Deals and any custom module — every write held behind the airlock, every change sealed into a signed receipt.\n\nWHO IT'S FOR: teams too small for a compliance function but regulated enough that 'who changed this client record, and who approved it' is a question they will eventually be asked — an eight-person insurance brokerage, a lending desk, a wealth-advisory practice. Also for anyone giving an AI agent write access to CRM and wanting a preview before it commits.\n\nTHE PROBLEM: CRM has no undo. A wrong filter on a mass update rewrites 400 client records at 6pm and there is no rollback, only a restore request and an awkward week. Zoho Flow and Zapier will both run that automation; neither can stop it, and neither leaves a tamper-evident record of who authorised it.\n\nREADS (no approval): verify_connection confirms auth and reports the org. describe_module returns every field including custom ones, so an agent never guesses at field names. search_records runs read-only COQL. list_records pages a module, get_record fetches one by id, list_users returns users and their ids.\n\nWRITES (preview then approve): create_record and update_record work across any module, up to 100 per call. upsert_records inserts or updates in place against duplicate-check fields. delete_record moves to the recycle bin, recoverable 60 days. convert_lead turns a Lead into a Contact and Account. add_note writes reasoning back onto a record.\n\nRELIABILITY: Zoho reports partial failure with HTTP 200, so a batch where 3 of 50 fail still looks successful. Every write returns succeeded, failed and per-record errors. Writes are never auto-retried after a server error, since Zoho has no idempotency key.\n\nQUICK START: create a Self Client at api-console.zoho.com with scopes ZohoCRM.modules.ALL, ZohoCRM.settings.fields.READ, ZohoCRM.users.READ and ZohoCRM.coql.READ. Exchange the grant code for a refresh token, then save a vault entry named 'zoho' with refresh_token, client_id, client_secret, token_url and instance_url, matching your org's datacenter. Run verify_connection first. Secrets stay in the vault, never in process environment.\n\nPLAN THEN APPLY: an approval binds to the inputs a human saw, not to the records they point at. Approve a diff over 80 records, someone edits nine while it sits there, and the write lands on state nobody reviewed. plan_update, plan_delete and plan_handover each snapshot the state they are about to change and fingerprint it; the matching apply re-reads, re-hashes, and refuses if anything moved. Scans page to completion, so a set is never half-reported. The update snapshot doubles as rollback data. plan_handover reports what a leaver owns across Leads, Deals, Contacts and Accounts, excluding closed deals unless asked; apply_handover re-scans, refuses on drift, and reassigns in one approved batch. The receipt is the handover record. contest:2026Q3",
+  "credential_spec": {
+    "provider": "zoho",
+    "category": "crm",
+    "name": "Zoho CRM",
+    "required": [
+      "client_id",
+      "client_secret",
+      "refresh_token",
+      "token_url",
+      "instance_url"
+    ],
+    "optional": [],
+    "shape": "dict",
+    "risk": "high",
+    "read_write": "write"
+  },
+  "requires": {
+    "subprocess": false
+  },
   "commands": [
     {
       "id": "zoho.verify_connection",
-      "title": "Verify Zoho credentials, routing and reachable org",
+      "title": "Preflight: check every scope this module needs",
       "provider": "zoho",
       "risk": "low",
       "mode": "read_only",
@@ -19,13 +39,14 @@ cat module.json
       "receipt_required": true,
       "input_schema": {},
       "output_schema": {
-        "authenticated": "string",
+        "ready": "string",
         "api_domain": "string",
-        "api_version": "string",
-        "leads_field_count": "number",
+        "scopes": "object",
+        "blocked_commands": "array",
         "org_name": "string",
-        "note": "string"
-      }
+        "summary": "string"
+      },
+      "description": "Probes each capability and reports which scopes are granted, which are missing, and exactly which commands a missing scope blocks. Run this first after configuring credentials."
     },
     {
       "id": "zoho.describe_module",
@@ -264,6 +285,152 @@ cat module.json
       "description": "Commit a plan made by zoho.plan_update. Re-runs the query, re-hashes the current state, and refuses the write if anything moved since the plan."
     },
     {
+      "id": "zoho.plan_delete",
+      "title": "Work out what a bulk delete would remove",
+      "provider": "zoho",
+      "risk": "low",
+      "mode": "read_only",
+      "requires": [
+        "ZOHO_OAUTH"
+      ],
+      "preview": false,
+      "receipt_required": true,
+      "input_schema": {
+        "module": {
+          "type": "string",
+          "required": true,
+          "description": "Module API name."
+        },
+        "query": {
+          "type": "string",
+          "required": true,
+          "description": "COQL SELECT picking the records to delete. Zoho requires a WHERE clause."
+        }
+      },
+      "output_schema": {
+        "module": "string",
+        "count": "number",
+        "records": "array",
+        "summary": "string"
+      }
+    },
+    {
+      "id": "zoho.apply_delete",
+      "title": "Commit a delete plan, refusing if the records moved",
+      "provider": "zoho",
+      "risk": "high",
+      "mode": "write_requires_approval",
+      "requires": [
+        "ZOHO_OAUTH"
+      ],
+      "preview": true,
+      "receipt_required": true,
+      "description": "Commit a plan from zoho.plan_delete. Re-runs the query, re-checks Modified_Time on every record, and refuses if anything changed since the plan. Records go to the recycle bin, recoverable for 60 days.",
+      "input_schema": {
+        "module": {
+          "type": "string",
+          "required": true,
+          "description": "Same as the plan."
+        },
+        "query": {
+          "type": "string",
+          "required": true,
+          "description": "Same COQL SELECT used for the plan."
+        }
+      },
+      "output_schema": {
+        "action": "string",
+        "succeeded": "number",
+        "failed": "number",
+        "records_deleted": "number"
+      }
+    },
+    {
+      "id": "zoho.plan_handover",
+      "title": "Count everything one user owns, before moving any of it",
+      "provider": "zoho",
+      "risk": "low",
+      "mode": "read_only",
+      "requires": [
+        "ZOHO_OAUTH"
+      ],
+      "preview": false,
+      "receipt_required": true,
+      "input_schema": {
+        "from_user": {
+          "type": "string",
+          "required": true,
+          "description": "Zoho user id of the person leaving. Use zoho.list_users."
+        },
+        "to_user": {
+          "type": "string",
+          "required": true,
+          "description": "Zoho user id taking over."
+        },
+        "modules": {
+          "type": "array",
+          "required": false,
+          "description": "Modules to scan. Defaults to Leads, Deals, Contacts, Accounts."
+        },
+        "closed_deals": {
+          "type": "string",
+          "required": false,
+          "description": "'skip' (default) leaves Closed Won and Closed Lost deals with the original owner. 'include' moves them too."
+        }
+      },
+      "output_schema": {
+        "from_user": "string",
+        "to_user": "string",
+        "modules": "array",
+        "counts": "object",
+        "total": "number",
+        "closed_deals_excluded": "number",
+        "expires_in_minutes": "number",
+        "summary": "string"
+      }
+    },
+    {
+      "id": "zoho.apply_handover",
+      "title": "Reassign everything the plan found, if nothing has moved since",
+      "provider": "zoho",
+      "risk": "high",
+      "mode": "write_requires_approval",
+      "requires": [
+        "ZOHO_OAUTH"
+      ],
+      "preview": true,
+      "receipt_required": true,
+      "input_schema": {
+        "from_user": {
+          "type": "string",
+          "required": true,
+          "description": "Same as the plan."
+        },
+        "to_user": {
+          "type": "string",
+          "required": true,
+          "description": "Same as the plan."
+        },
+        "modules": {
+          "type": "array",
+          "required": false,
+          "description": "Same as the plan."
+        },
+        "closed_deals": {
+          "type": "string",
+          "required": false,
+          "description": "Same as the plan."
+        }
+      },
+      "output_schema": {
+        "action": "string",
+        "moved": "number",
+        "failed": "number",
+        "per_module": "object",
+        "errors": "array"
+      }
+    },
+    {
       "id": "zoho.create_record",
       "title": "Create records in a Zoho CRM module",
       "provider": "zoho",
@@ -475,9 +642,5 @@ cat module.json
         "failed": "number"
       }
     }
-  ],
-  "publisher_pubkey": "be209aad9734a7e3b8b301560bcace329f26c567ca9ef0880fb8358c72ccd761",
-  "requires": {
-    "subprocess": false
-  }
+  ]
 }
