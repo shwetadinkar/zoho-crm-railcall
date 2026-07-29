@@ -1,0 +1,53 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # 3.9 is the floor the RailCall station guarantees; 3.12 is what most
+        # stations actually run.
+        python: ["3.9", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Run the suite
+        run: python3 test_handler.py
+      - name: Manifest and handler must stay in step
+        run: |
+          python3 - <<'PY'
+          import ast, json, re, sys
+          m = json.load(open("module.json"))
+          src = open("handlers/handler.py").read()
+          fns = [n.name for n in ast.parse(src).body if isinstance(n, ast.FunctionDef)]
+          allowed = {"string", "number", "object", "array"}
+          bad = []
+          ids = [c["id"] for c in m["commands"]]
+          if len(ids) != len(set(ids)):
+              bad.append("duplicate command ids")
+          dupes = {n for n in fns if fns.count(n) > 1}
+          if dupes:
+              bad.append("duplicate functions: %s" % dupes)
+          if re.findall(r"[^\x00-\x7F]", src):
+              bad.append("non-ascii in handler")
+          for c in m["commands"]:
+              if c["id"].replace(".", "_") not in fns:
+                  bad.append("no handler for " + c["id"])
+              for k in ("id", "mode", "risk"):
+                  if not c.get(k):
+                      bad.append("%s missing %s" % (c["id"], k))
+              for f, s in (c["input_schema"] or {}).items():
+                  if s.get("type") not in allowed:
+                      bad.append("%s.%s has unsupported type %s" % (c["id"], f, s.get("type")))
+          if bad:
+              print("\n".join(bad)); sys.exit(1)
+          print("manifest ok: %d commands" % len(m["commands"]))
+          PY
