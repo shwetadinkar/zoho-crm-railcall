@@ -1,7 +1,7 @@
 {
   "id": "shweta/zoho-crm",
   "name": "zoho-crm",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "provider": "zoho",
   "homepage": "https://github.com/shwetadinkar/zoho-crm-railcall/blob/main/COMMANDS.md",
   "tests_url": "https://github.com/shwetadinkar/zoho-crm-railcall/blob/main/test_handler.py",
