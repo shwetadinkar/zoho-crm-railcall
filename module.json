@@ -642,5 +642,6 @@
         "failed": "number"
       }
     }
-  ]
+  ],
+  "publisher_pubkey": "be209aad9734a7e3b8b301560bcace329f26c567ca9ef0880fb8358c72ccd761"
 }
