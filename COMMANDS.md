@@ -1,7 +1,7 @@
 # shweta/zoho-crm - command reference
 
-Eighteen commands. Nine reads, which run without approval. Nine writes, which
-stop at the airlock until a human approves the exact payload.
+Twenty-two commands. Twelve reads, which run without approval. Ten writes,
+which stop at the airlock until a human approves the exact payload.
 
 Examples below use Zoho's own demo records, so you can follow along in a fresh
 trial org.
@@ -229,7 +229,13 @@ than surfacing a bare 401.
 ## zoho.plan_update
 
 Works out what a bulk update would change, without changing anything. Snapshots
-the current value of every field being written and hashes them.
+the current value of every field being written, plus `Modified_Time`, and hashes
+them together.
+
+`Modified_Time` is in the fingerprint but never in the payload. Without it the
+hash covers only the fields being written, so an edit to any *other* column on a
+matched record would pass unnoticed and the write would land on state nobody
+reviewed. Reading it costs one extra column and closes that gap.
 
 | input | type | required | notes |
 |---|---|---|---|
@@ -255,9 +261,9 @@ the current value of every field being written and hashes them.
   "fields": ["Lead_Status"],
   "expires_in_minutes": 60,
   "records": [
-    {"id": "1352736000000533111", "before": {"Lead_Status": "Lost Lead"}},
-    {"id": "1352736000000533106", "before": {"Lead_Status": "Lost Lead"}},
-    {"id": "1352736000000533107", "before": {"Lead_Status": "Contacted"}}
+    {"id": "1352736000000533111", "before": {"Lead_Status": "Lost Lead", "Modified_Time": "2026-07-29T18:44:09+05:30"}},
+    {"id": "1352736000000533106", "before": {"Lead_Status": "Lost Lead", "Modified_Time": "2026-07-28T11:02:55+05:30"}},
+    {"id": "1352736000000533107", "before": {"Lead_Status": "Contacted", "Modified_Time": "2026-07-30T09:15:01+05:30"}}
   ],
   "summary": "3 records matched, 2 would actually change on Lead_Status. Run zoho.apply_update with the same module, query and changes to commit."
 }
@@ -265,7 +271,8 @@ the current value of every field being written and hashes them.
 
 `count` is what matched; `would_change` excludes records already holding the
 target value. The `records` array is your rollback data: it holds every prior
-value.
+value, and `apply_update` writes it into the ledger so `plan_rollback` can read
+it back long after the plan itself has expired.
 
 **Errors.** A query matching nothing raises rather than planning an empty
 change. Field names must be plain api_names; anything else is refused before it
@@ -341,6 +348,134 @@ Every command below is `write_requires_approval`. The cycle is
 preview, approve, execute. Executing without a matching approval returns
 `blocked_by_policy` with "no human approval bound to this exact payload".
 
+## zoho.plan_rollback
+
+Works out what undoing a previously applied bulk update would restore. Changes
+nothing.
+
+Takes the same three inputs that performed the apply. There is no rollback token:
+a token would be an identifier, and receipts redact identifiers, so it could not
+survive the round trip. The module, query and changes you already typed are the
+address.
+
+| input | type | required | notes |
+|---|---|---|---|
+| `module` | string | yes | the module that was applied |
+| `query` | string | yes | the same COQL SELECT used for the apply |
+| `changes` | object | yes | the same changes object used for the apply |
+
+```json
+{
+  "module": "Leads",
+  "query": "select Last_Name from Leads where Lead_Status = 'Lost Lead'",
+  "changes": { "Lead_Status": "Contacted" }
+}
+```
+
+```json
+{
+  "ok": true,
+  "module": "Leads",
+  "applied_at": "2026-08-01T07:02:19Z",
+  "count": 2,
+  "fields": ["Lead_Status"],
+  "records": [
+    {"id": "1352736000000533111", "restore_to": {"Lead_Status": "Lost Lead"}},
+    {"id": "1352736000000533106", "restore_to": {"Lead_Status": "Lost Lead"}}
+  ],
+  "changed_again": [],
+  "missing": [],
+  "expires_in_minutes": 60,
+  "summary": "Would restore 2 records on Lead_Status to their values before the apply of 2026-08-01T07:02:19Z. 0 have been changed again since and 0 no longer exist; apply_rollback refuses while any record has moved."
+}
+```
+
+`changed_again` lists records that no longer hold the value the apply wrote,
+meaning somebody has edited them since. `missing` lists records that no longer
+exist. Both are reported rather than skipped: a blind restore would discard
+whatever the other person did.
+
+**Errors.** Raises if the ledger holds no applied change for these three inputs.
+Also raises for entries written before 0.6.0, which do not carry prior values.
+
+## zoho.verify_ledger
+
+Recomputes every link in the local change ledger and reports whether it holds.
+Read-only.
+
+Each ledger entry carries the hash of the entry before it, so editing or removing
+any entry breaks every link after it. This walks the chain from the start and
+names the first entry that fails.
+
+No inputs.
+
+```json
+{}
+```
+
+```json
+{
+  "ok": true,
+  "intact": true,
+  "entries_verified": 14,
+  "first_broken_entry": null,
+  "applied": 11,
+  "refused": 3,
+  "covers": "changes made through this module only; edits made in the Zoho UI are not visible here",
+  "summary": "Ledger intact. 14 entries verified, 11 applied and 3 refused. Tamper-evident, not tamper-proof: this proves no entry was altered in place."
+}
+```
+
+**Two honest limits, both stated in the output rather than only here.**
+
+It is *tamper-evident*, not tamper-proof. It proves no entry was altered in
+place. Anyone who can write the file can rewrite the whole chain from any point.
+
+It covers changes made *through this module*. Someone editing in the Zoho UI is
+invisible to it. It is a record of governed changes, not an audit trail of the
+org.
+
+## zoho.audit_pack
+
+Writes the ledger out as a file for review, and returns the path and the counts.
+Read-only.
+
+The contents are not returned inline. Receipts redact identifiers, so anything
+returned in the output would come back with its record ids stripped, which is
+precisely what makes a pack worth reading. A human opens the file.
+
+| input | type | required | notes |
+|---|---|---|---|
+| `since` | string | no | ISO date or datetime; omit for everything |
+| `until` | string | no | ISO date or datetime; omit for everything |
+| `module` | string | no | restrict to one module api_name |
+| `outcome` | string | no | `applied` or `refused`; omit for both |
+
+```json
+{ "since": "2026-07-01", "outcome": "refused" }
+```
+
+```json
+{
+  "ok": true,
+  "pack_path": "/home/you/.railcall/station/.railcall_workspace/audit_pack.20260801T071029Z.json",
+  "entries": 3,
+  "applied": 0,
+  "refused": 3,
+  "records_changed": 0,
+  "chain_intact": true,
+  "summary": "Wrote 3 ledger entries to audit_pack.20260801T071029Z.json — 0 applied, 3 refused, 0 records changed. Chain intact. Refusals are the useful half: they are the evidence the control fired."
+}
+```
+
+Each entry in the file holds the outcome, command, module, timestamp, the two
+fingerprints where they differ, and the chain hashes. Applied entries also carry
+the prior values.
+
+`entries_verified` in the file's `chain` block counts the *whole* ledger, not the
+filtered subset, because integrity is a property of the chain rather than of your
+query.
+
 ## zoho.apply_update
 
 Commits a plan from `plan_update`. Re-runs the query, re-hashes the current
@@ -366,9 +501,13 @@ Inputs are identical to `plan_update` minus `max_records`: `module`, `query`,
   "records_applied": 3,
   "ids": ["1352736000000533111", "1352736000000533106", "1352736000000533107"],
   "errors": [],
+  "ledger_seq": 14,
   "origin": {"initiated_via": "railcall-airlock", "stamp": "2026-07-29T15:22:15Z"}
 }
 ```
+
+`ledger_seq` is this change's position in the local ledger. The entry holds every
+prior value, which is what `zoho.plan_rollback` reads.
 
 On drift:
 
@@ -379,7 +518,12 @@ Re-run zoho.plan_update and review the new plan.
 ```
 
 A record that newly matches the filter counts as drift too, since the approved
-set is no longer the set in front of you.
+set is no longer the set in front of you. So does an edit to a field this command
+is not writing: `Modified_Time` is part of the fingerprint, so any change to a
+matched record refuses.
+
+The refusal is written to the ledger as well as the success. A stopped write is
+the only direct evidence the control works, so it is kept.
 
 ## zoho.apply_delete
 
@@ -420,6 +564,45 @@ and optionally `modules` and `closed_deals`, which must match what was planned.
 
 Reassignment runs in batches of 100 per module. The receipt is your handover
 record: who moved what, to whom, approved by whom, when.
+
+## zoho.apply_rollback
+
+Commits a plan from `plan_rollback`, restoring the prior values. Inputs are the
+same three: `module`, `query`, `changes`.
+
+A rollback is a write like any other and gets no special dispensation. It
+re-reads, re-hashes, and refuses if the records moved since the rollback plan was
+made. Undoing onto records somebody has since edited is the exact failure this
+module exists to stop.
+
+```json
+{
+  "module": "Leads",
+  "query": "select Last_Name from Leads where Lead_Status = 'Lost Lead'",
+  "changes": { "Lead_Status": "Contacted" }
+}
+```
+
+```json
+{
+  "ok": true,
+  "action": "roll back Leads",
+  "succeeded": 2,
+  "failed": 0,
+  "records_restored": 2,
+  "fingerprint_verified": "sha256:127366c7...",
+  "ledger_seq": 15,
+  "errors": []
+}
+```
+
+The restore is itself recorded, with the values that were there before it ran, so
+a rollback can be rolled back.
+
+**Not available for deletes.** `plan_rollback` covers `apply_update` only. A
+deleted record cannot be restored by a write; the ledger entry for a delete is a
+record of what was removed, not rollback data. Zoho's recycle bin holds deletions
+for 60 days.
 
 ## zoho.create_record
 
@@ -590,6 +773,13 @@ duplicate. Check Zoho, then re-approve.
 **"No current plan"** - apply must repeat the planned inputs exactly. Plans
 expire after 60 minutes.
 
+**"No applied change in the ledger"** - `plan_rollback` addresses an apply by the
+same module, query and changes that performed it. Run `zoho.audit_pack` to see
+what is on record.
+
+**"Refusing to roll back"** - the records moved between the rollback plan and the
+rollback apply. Re-plan and review.
+
 **"matches more than 2000 records"** - a scan refuses rather than acting on a
 partial set. Narrow the query.
 
@@ -599,3 +789,14 @@ partial set. Narrow the query.
 Bulk and Notification APIs are not wrapped: both are asynchronous or
 push-based and do not fit a synchronous handler. Activities, attachments and
 tags are not covered yet.
+
+The ledger is local to the station and rotates past 5000 entries, sealing the
+old file under a timestamped name and starting a fresh chain from the last
+sealed hash. Ledger entries hold record ids and prior field values, so the file
+is personal data and lives in the station workspace beside the plans.
+
+Ledger writes happen after the API call, not before. A write that lands and is
+then followed by a failed ledger write is real and unrecorded. The alternative
+would be recording changes that never happened, which is worse for an evidence
+file. The ledger does not claim completeness; it claims not to lie about what it
+holds.
