@@ -1,11 +1,11 @@
 {
   "id": "shweta/zoho-crm",
   "name": "zoho-crm",
-  "version": "0.5.2",
+  "version": "0.6.0",
   "provider": "zoho",
   "homepage": "https://github.com/shwetadinkar/zoho-crm-railcall",
   "tests_url": "https://github.com/shwetadinkar/zoho-crm-railcall/blob/main/test_handler.py",
-  "description": "Governed Zoho CRM for small teams and AI agents. Eighteen commands across Leads, Contacts, Accounts, Deals and any custom module. Every write is held behind the airlock and sealed into a signed receipt.\n\nWHO IT'S FOR: teams too small for a compliance function but regulated enough that 'who changed this client record, and who approved it' gets asked eventually. An eight-person insurance brokerage, a lending desk, a wealth-advisory practice. Also anyone giving an AI agent write access to a CRM.\n\nTHE PROBLEM: CRM has no undo. A wrong filter on a mass update rewrites 400 client records and there is no rollback, only a restore request. Zoho Flow and Zapier will both run that automation; neither can stop it, and neither records who authorised it.\n\nNINE READS (no approval): verify_connection is a preflight that probes every scope and names any missing one plus the commands it blocks. describe_module returns every field including custom ones, so an agent never guesses at names. search_records runs read-only COQL. list_records pages a module, get_record fetches one by id, list_users returns users and their ids. plan_update, plan_delete and plan_handover work out what a change would do without doing it.\n\nNINE WRITES (preview then approve): apply_update, apply_delete and apply_handover commit the matching plan. create_record and update_record work on any module, 100 per call. upsert_records inserts or updates in place against duplicate-check fields. delete_record moves to the recycle bin, recoverable 60 days. convert_lead turns a Lead into a Contact and Account. add_note writes reasoning back onto a record.\n\nRELIABILITY: Zoho reports partial failure with HTTP 200, so a batch where 3 of 50 fail still looks successful. Every write returns succeeded, failed and per-record errors. Writes are never auto-retried after a server error, since Zoho has no idempotency key.\n\nQUICK START: create a Self Client at api-console.zoho.com with scopes ZohoCRM.modules.ALL, ZohoCRM.settings.fields.READ, ZohoCRM.users.READ and ZohoCRM.coql.READ. Exchange the grant code for a refresh token, then save a vault entry named 'zoho' holding refresh_token, client_id, client_secret, token_url and instance_url for your datacenter. Run verify_connection first. Secrets stay in the vault, never in process environment.\n\nPLAN THEN APPLY: an approval binds to the inputs a human saw, not to the records they point at. Approve a diff over 80 records, someone edits nine while it sits there, and the write lands on state nobody reviewed. Each plan snapshots the state it will change and fingerprints it; the matching apply re-reads, re-hashes, and refuses if anything moved. Scans page to completion, so a set is never half-reported. The update snapshot doubles as rollback data. plan_handover reports what a leaver owns across four modules, excluding closed deals unless asked; apply_handover re-scans and reassigns in one approved batch, and the receipt is the handover record. contest:2026Q3",
+  "description": "Governed Zoho CRM for small teams and AI agents. Twenty-two commands across Leads, Contacts, Accounts, Deals and any custom module. Every write is held behind the airlock and sealed into a signed receipt.\n\nWHO IT'S FOR: teams too small for a compliance function but regulated enough that 'who changed this client record, and who approved it' gets asked eventually. Also anyone giving an AI agent write access to a CRM.\n\nTHE PROBLEM: CRM has no undo. A wrong filter on a mass update rewrites 400 client records and there is no rollback, only a restore request. Zoho Flow and Zapier will both run that automation; neither can stop it, and neither records who authorised it.\n\nTWELVE READS (no approval): verify_connection probes every scope and names any missing one plus the commands it blocks. describe_module returns every field including custom ones. search_records runs read-only COQL. list_records pages a module, get_record fetches one by id, list_users returns users and their ids. plan_update, plan_delete and plan_handover work out what a change would do without doing it. plan_rollback reports what undoing an applied change would restore. verify_ledger and audit_pack expose the local record of every change and every refusal.\n\nTEN WRITES (preview then approve): apply_update, apply_delete, apply_handover and apply_rollback commit the matching plan, each refusing if the records moved since review. create_record and update_record work on any module, 100 per call. upsert_records inserts or updates against duplicate-check fields. delete_record moves to the recycle bin. convert_lead turns a Lead into a Contact and Account. add_note writes reasoning back onto a record.\n\nPLAN THEN APPLY: an approval binds to the inputs a human saw, not to the records they point at. Approve a diff over 80 records, someone edits nine while it sits there, and the write lands on state nobody reviewed. Each plan snapshots the state it will change and fingerprints it; the matching apply re-reads, re-hashes, and refuses if anything moved. Scans page to completion, so a set is never half-reported. Applied changes are recorded in a hash-chained local ledger, so plan_rollback can restore prior values and audit_pack can show every refusal.\n\nRELIABILITY: Zoho reports partial failure with HTTP 200, so a batch where 3 of 50 fail still looks successful. Every write returns succeeded, failed and per-record errors. Writes are never auto-retried after a server error, since Zoho has no idempotency key. Setup and scopes: see README. contest:2026Q3",
   "credential_spec": {
     "provider": "zoho",
     "category": "crm",
@@ -641,7 +641,148 @@
         "succeeded": "number",
         "failed": "number"
       }
+    },
+    {
+      "id": "zoho.verify_ledger",
+      "title": "Check the local change ledger has not been altered",
+      "provider": "zoho",
+      "risk": "low",
+      "mode": "read_only",
+      "requires": [
+        "ZOHO_OAUTH"
+      ],
+      "preview": false,
+      "receipt_required": true,
+      "input_schema": {},
+      "output_schema": {
+        "intact": "string",
+        "entries_verified": "number",
+        "first_broken_entry": "number",
+        "applied": "number",
+        "refused": "number",
+        "covers": "string",
+        "summary": "string"
+      },
+      "description": "Recomputes every link in the hash-chained change ledger and names the first entry that fails. Tamper-evident, not tamper-proof, and covers only changes made through this module."
+    },
+    {
+      "id": "zoho.audit_pack",
+      "title": "Write the change ledger out as a reviewable file",
+      "provider": "zoho",
+      "risk": "low",
+      "mode": "read_only",
+      "requires": [
+        "ZOHO_OAUTH"
+      ],
+      "preview": false,
+      "receipt_required": true,
+      "input_schema": {
+        "since": {
+          "type": "string",
+          "required": false,
+          "description": "ISO date or datetime. Omit for everything."
+        },
+        "until": {
+          "type": "string",
+          "required": false,
+          "description": "ISO date or datetime. Omit for everything."
+        },
+        "module": {
+          "type": "string",
+          "required": false,
+          "description": "Restrict to one module API name."
+        },
+        "outcome": {
+          "type": "string",
+          "required": false,
+          "description": "'applied' or 'refused'. Omit for both."
+        }
+      },
+      "output_schema": {
+        "pack_path": "string",
+        "entries": "number",
+        "applied": "number",
+        "refused": "number",
+        "records_changed": "number",
+        "chain_intact": "string",
+        "summary": "string"
+      },
+      "description": "Writes every recorded change and every refusal to a file in the station workspace and returns the path. The refusals are the evidence the control fired. Contents are not returned inline because identifiers are redacted from receipts."
+    },
+    {
+      "id": "zoho.plan_rollback",
+      "title": "Plan an undo of a previously applied bulk update",
+      "provider": "zoho",
+      "risk": "low",
+      "mode": "read_only",
+      "requires": [
+        "ZOHO_OAUTH"
+      ],
+      "preview": false,
+      "receipt_required": true,
+      "input_schema": {
+        "module": {
+          "type": "string",
+          "required": true,
+          "description": "Module API name, the same one that was applied."
+        },
+        "query": {
+          "type": "string",
+          "required": true,
+          "description": "The same COQL SELECT used for the apply."
+        },
+        "changes": {
+          "type": "object",
+          "required": true,
+          "description": "The same changes object used for the apply."
+        }
+      },
+      "output_schema": {
+        "records": "array",
+        "count": "number",
+        "applied_at": "string",
+        "missing": "array",
+        "changed_again": "array",
+        "summary": "string"
+      },
+      "description": "Looks up the last applied change matching these three inputs and reports what restoring the prior values would do, including any record that has been changed again since or no longer exists. Changes nothing."
+    },
+    {
+      "id": "zoho.apply_rollback",
+      "title": "Restore prior values, refusing if anything moved since the plan",
+      "provider": "zoho",
+      "risk": "high",
+      "mode": "write_requires_approval",
+      "requires": [
+        "ZOHO_OAUTH"
+      ],
+      "preview": true,
+      "receipt_required": true,
+      "input_schema": {
+        "module": {
+          "type": "string",
+          "required": true,
+          "description": "Module API name, the same one that was planned."
+        },
+        "query": {
+          "type": "string",
+          "required": true,
+          "description": "The same COQL SELECT used for the rollback plan."
+        },
+        "changes": {
+          "type": "object",
+          "required": true,
+          "description": "The same changes object used for the rollback plan."
+        }
+      },
+      "output_schema": {
+        "action": "string",
+        "succeeded": "number",
+        "failed": "number",
+        "records_restored": "number",
+        "ledger_seq": "number"
+      },
+      "description": "Commits a plan made by zoho.plan_rollback. A rollback is a write like any other: it re-reads, re-hashes and refuses if the records moved since the plan."
     }
-  ],
-  "publisher_pubkey": "be209aad9734a7e3b8b301560bcace329f26c567ca9ef0880fb8358c72ccd761"
+  ]
 }
