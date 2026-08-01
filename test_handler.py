@@ -869,7 +869,8 @@ def t_every_high_risk_write_has_a_plan_step():
     """
     import json as _j
     m = _j.load(open(MANIFEST))
-    planned = {"zoho.apply_update", "zoho.apply_delete", "zoho.apply_handover"}
+    planned = {"zoho.apply_update", "zoho.apply_delete", "zoho.apply_handover",
+               "zoho.apply_rollback"}
     by_id = {"zoho.delete_record", "zoho.convert_lead", "zoho.update_record"}
     high = {c["id"] for c in m["commands"]
             if c.get("risk") == "high" and c.get("mode") == "write_requires_approval"}
@@ -1019,6 +1020,322 @@ def t_origin_records_string_stamp():
                                   "2026-07-29T15:22:15Z")
     assert out["origin"]["stamp"] == "2026-07-29T15:22:15Z", out["origin"]
     assert out["origin"]["initiated_via"] == "railcall-airlock", out["origin"]
+
+
+
+# ------------------------------------------------------------------- ledger
+def _ledger_helpers(matched, current, store=None):
+    """Two-response COQL fake plus a shared workspace store.
+
+    Returns the store too, so a test can reach in and tamper with the ledger
+    the way an attacker with disk access would.
+    """
+    calls = []
+    store = store if store is not None else {}
+
+    def _post(url, obj, **k):
+        calls.append(("POST", url))
+        q = (obj or {}).get("select_query", "")
+        rows = current if " in (" in q else matched
+        return 200, json.dumps({"data": rows}).encode()
+
+    def _put(url, data, **k):
+        calls.append(("PUT", url))
+        return 200, json.dumps(
+            {"data": [{"code": "SUCCESS", "details": {"id": "1"}}]}).encode()
+
+    return {"oauth_refresh": lambda p, **k: {"access_token": "t",
+                                             "instance_url": "https://x"},
+            "http_get_json": lambda u, **k: (200, b"{}"),
+            "http_post_json": _post,
+            "http_patch_json": _put,
+            "http_delete_json": lambda u, **k: (200, b"{}"),
+            "WS": "/tmp/rc-test",
+            "jload": lambda path, default=None: store.get(path, default if default is not None else {}),
+            "jsave": lambda path, obj: store.__setitem__(path, obj)}, calls, store
+
+
+def _load_put(h):
+    """load(), with the hand-rolled PUT stubbed.
+
+    _put bypasses __rc_helpers__ entirely because the platform ships no PUT, so
+    a fake helper dict cannot intercept it.
+    """
+    m = load(h)
+    m._put = lambda url, obj, hdrs: (200, json.dumps({"data": [
+        {"code": "SUCCESS", "details": {"id": r.get("id", "1")}}
+        for r in (obj or {}).get("data", [{}])]}).encode())
+    return m
+
+
+def t_ledger_chain_intact():
+    h, _, _ = _ledger_helpers([], [])
+    m = load(h)
+    for i in range(3):
+        m._ledger_append(m._ledger_note("applied", "apply_update", "Leads",
+                                        "k%d" % i, {"records": i}))
+    intact, checked, bad = m._ledger_verify()
+    assert intact and checked == 3 and bad is None, (intact, checked, bad)
+
+
+def t_ledger_detects_edited_entry():
+    """Change one field in a sealed entry and the chain must name it."""
+    h, _, store = _ledger_helpers([], [])
+    m = load(h)
+    for i in range(4):
+        m._ledger_append(m._ledger_note("applied", "apply_update", "Leads",
+                                        "k%d" % i, {"records": i}))
+    book = store["/tmp/rc-test/zoho_ledger.json"]
+    book["entries"][1]["detail"]["records"] = 999
+    intact, checked, bad = m._ledger_verify()
+    assert not intact and bad == 2, (intact, checked, bad)
+    assert checked == 1, checked
+
+
+def t_ledger_detects_removed_entry():
+    """Deleting an entry breaks the prev link of the one after it."""
+    h, _, store = _ledger_helpers([], [])
+    m = load(h)
+    for i in range(4):
+        m._ledger_append(m._ledger_note("refused", "apply_update", "Leads",
+                                        "k%d" % i, {"records": i}))
+    book = store["/tmp/rc-test/zoho_ledger.json"]
+    del book["entries"][1]
+    intact, _checked, bad = m._ledger_verify()
+    assert not intact and bad == 2, (intact, bad)
+
+
+def t_ledger_rotates_and_stays_linked():
+    """A rotated chain starts from the last sealed hash, not from genesis."""
+    h, _, store = _ledger_helpers([], [])
+    m = load(h)
+    m._LEDGER_MAX = 3
+    for i in range(4):
+        m._ledger_append(m._ledger_note("applied", "apply_update", "Leads",
+                                        "k%d" % i, {"records": i}))
+    live = store["/tmp/rc-test/zoho_ledger.json"]
+    archives = [k for k in store if k.startswith("/tmp/rc-test/zoho_ledger.json.")]
+    assert len(archives) == 1, list(store)
+    assert len(live["entries"]) == 1, live["entries"]
+    sealed = store[archives[0]]["entries"][-1]["entry_hash"]
+    assert live["chain_start"] == sealed, (live["chain_start"], sealed)
+    intact, _c, _b = m._ledger_verify()
+    assert intact
+
+
+def t_verify_ledger_command_reports_counts():
+    h, _, _ = _ledger_helpers([], [])
+    m = load(h)
+    m._ledger_append(m._ledger_note("applied", "apply_update", "Leads", "a", {}))
+    m._ledger_append(m._ledger_note("refused", "apply_update", "Leads", "b", {}))
+    out, err = m.zoho_verify_ledger({}, {})
+    assert err is None
+    assert out["intact"] and out["applied"] == 1 and out["refused"] == 1, out
+    assert "not tamper-proof" in out["summary"], out["summary"]
+
+
+# ------------------------------------------------- Modified_Time drift guard
+def t_apply_update_refuses_on_unrelated_field_edit():
+    """The gap this release closes.
+
+    Plan Lead_Status. Someone edits Email on a matched record. Before 0.6.0 the
+    fingerprint covered only Lead_Status, so the hash was unchanged and the
+    write went through onto a record nobody had reviewed.
+    """
+    matched = [{"id": "1"}]
+    planned = [{"id": "1", "Lead_Status": "New", "Modified_Time": "2026-01-01T00:00:00+05:30"}]
+    h, _, store = _ledger_helpers(matched, planned)
+    m = load(h)
+    args = {"module": "Leads", "query": "select id from Leads where x = 1",
+            "changes": {"Lead_Status": "Contacted"}}
+    m.zoho_plan_update(args, {})
+
+    # Email changed, Lead_Status untouched, Modified_Time moved as Zoho would.
+    edited = [{"id": "1", "Lead_Status": "New",
+               "Modified_Time": "2026-06-02T11:00:00+05:30"}]
+    h2, _, _ = _ledger_helpers(matched, edited, store=store)
+    m2 = load(h2)
+    try:
+        m2.zoho_apply_update(args, {})
+        assert False, "should have refused"
+    except RuntimeError as e:
+        assert "moved since the plan" in str(e), e
+
+
+def t_refusal_is_written_to_the_ledger():
+    matched = [{"id": "1"}]
+    h, _, store = _ledger_helpers(matched, [{"id": "1", "S": "a", "Modified_Time": "t1"}])
+    m = load(h)
+    args = {"module": "Leads", "query": "select id from Leads where x = 1",
+            "changes": {"S": "z"}}
+    m.zoho_plan_update(args, {})
+    h2, _, _ = _ledger_helpers(matched, [{"id": "1", "S": "b", "Modified_Time": "t2"}],
+                               store=store)
+    m2 = load(h2)
+    try:
+        m2.zoho_apply_update(args, {})
+    except RuntimeError:
+        pass
+    book = store["/tmp/rc-test/zoho_ledger.json"]
+    assert len(book["entries"]) == 1, book
+    entry = book["entries"][0]
+    assert entry["outcome"] == "refused", entry
+    assert entry["command"] == "apply_update", entry
+
+
+def t_apply_records_prior_values_for_rollback():
+    matched = [{"id": "1"}]
+    rows = [{"id": "1", "S": "old", "Modified_Time": "t1"}]
+    h, _, store = _ledger_helpers(matched, rows)
+    m = _load_put(h)
+    args = {"module": "Leads", "query": "select id from Leads where x = 1",
+            "changes": {"S": "new"}}
+    m.zoho_plan_update(args, {})
+    out, err = m.zoho_apply_update(args, {})
+    assert err is None and out["records_applied"] == 1, out
+    entry = store["/tmp/rc-test/zoho_ledger.json"]["entries"][0]
+    assert entry["outcome"] == "applied", entry
+    before = entry["detail"]["before"]
+    assert before == [{"id": "1", "before": {"S": "old"}}], before
+    assert "Modified_Time" not in before[0]["before"], before
+
+
+# ----------------------------------------------------------------- rollback
+def t_plan_rollback_without_an_apply_raises():
+    h, _, _ = _ledger_helpers([], [])
+    m = load(h)
+    try:
+        m.zoho_plan_rollback({"module": "Leads", "query": "select id from Leads where x=1",
+                              "changes": {"S": "z"}}, {})
+        assert False
+    except RuntimeError as e:
+        assert "No applied change" in str(e), e
+
+
+def t_rollback_restores_prior_values():
+    matched = [{"id": "1"}]
+    h, _, store = _ledger_helpers(matched, [{"id": "1", "S": "old", "Modified_Time": "t1"}])
+    m = _load_put(h)
+    args = {"module": "Leads", "query": "select id from Leads where x = 1",
+            "changes": {"S": "new"}}
+    m.zoho_plan_update(args, {})
+    m.zoho_apply_update(args, {})
+
+    # The org now reflects the applied change.
+    after = [{"id": "1", "S": "new", "Modified_Time": "t2"}]
+    h2, _, _ = _ledger_helpers(matched, after, store=store)
+    m2 = _load_put(h2)
+    plan, err = m2.zoho_plan_rollback(args, {})
+    assert err is None and plan["count"] == 1, plan
+    assert plan["records"][0]["restore_to"] == {"S": "old"}, plan["records"]
+    assert plan["changed_again"] == [], plan["changed_again"]
+
+    h3, _calls, _ = _ledger_helpers(matched, after, store=store)
+    m3 = _load_put(h3)
+    out, err = m3.zoho_apply_rollback(args, {})
+    assert err is None and out["records_restored"] == 1, out
+    assert out["succeeded"] == 1 and out["failed"] == 0, out
+    # the restore is itself recorded, so an undo can be undone
+    entries = store["/tmp/rc-test/zoho_ledger.json"]["entries"]
+    assert [e["outcome"] for e in entries] == ["applied", "applied"], entries
+    assert entries[-1]["detail"]["before"] == [{"id": "1", "before": {"S": "new"}}], entries[-1]
+
+
+def t_plan_rollback_flags_records_changed_again():
+    matched = [{"id": "1"}]
+    h, _, store = _ledger_helpers(matched, [{"id": "1", "S": "old", "Modified_Time": "t1"}])
+    m = _load_put(h)
+    args = {"module": "Leads", "query": "select id from Leads where x = 1",
+            "changes": {"S": "new"}}
+    m.zoho_plan_update(args, {})
+    m.zoho_apply_update(args, {})
+
+    # Somebody moved it on again after the apply.
+    h2, _, _ = _ledger_helpers(matched, [{"id": "1", "S": "third", "Modified_Time": "t3"}],
+                               store=store)
+    m2 = _load_put(h2)
+    plan, _err = m2.zoho_plan_rollback(args, {})
+    assert plan["changed_again"] == [{"id": "1", "fields": ["S"]}], plan["changed_again"]
+
+
+def t_apply_rollback_refuses_on_drift():
+    matched = [{"id": "1"}]
+    h, _, store = _ledger_helpers(matched, [{"id": "1", "S": "old", "Modified_Time": "t1"}])
+    m = _load_put(h)
+    args = {"module": "Leads", "query": "select id from Leads where x = 1",
+            "changes": {"S": "new"}}
+    m.zoho_plan_update(args, {})
+    m.zoho_apply_update(args, {})
+
+    h2, _, _ = _ledger_helpers(matched, [{"id": "1", "S": "new", "Modified_Time": "t2"}],
+                               store=store)
+    m2 = _load_put(h2)
+    m2.zoho_plan_rollback(args, {})
+
+    # Record moves between the rollback plan and the rollback apply.
+    h3, _, _ = _ledger_helpers(matched, [{"id": "1", "S": "meddled", "Modified_Time": "t9"}],
+                               store=store)
+    m3 = _load_put(h3)
+    try:
+        m3.zoho_apply_rollback(args, {})
+        assert False, "should have refused"
+    except RuntimeError as e:
+        assert "Refusing to roll back" in str(e), e
+    outcomes = [e["outcome"] for e in store["/tmp/rc-test/zoho_ledger.json"]["entries"]]
+    assert outcomes == ["applied", "refused"], outcomes
+
+
+# --------------------------------------------------------------- audit pack
+def t_audit_pack_writes_a_file_not_inline_ids():
+    h, _, store = _ledger_helpers([], [])
+    m = load(h)
+    m._ledger_append(m._ledger_note("applied", "apply_update", "Leads", "a",
+                                    {"records": 3}))
+    m._ledger_append(m._ledger_note("refused", "apply_update", "Leads", "b",
+                                    {"records": 2}))
+    out, err = m.zoho_audit_pack({}, {})
+    assert err is None
+    assert out["entries"] == 2 and out["applied"] == 1 and out["refused"] == 1, out
+    assert out["records_changed"] == 3, out
+    assert out["pack_path"] in store, list(store)
+    # ids must not travel back inline; the pack is a file for exactly this reason
+    assert "entries" not in str(out.get("records", "")), out
+
+
+def t_audit_pack_filters_by_outcome_and_module():
+    h, _, _ = _ledger_helpers([], [])
+    m = load(h)
+    m._ledger_append(m._ledger_note("applied", "apply_update", "Leads", "a", {"records": 1}))
+    m._ledger_append(m._ledger_note("refused", "apply_update", "Deals", "b", {"records": 5}))
+    out, _ = m.zoho_audit_pack({"outcome": "refused"}, {})
+    assert out["entries"] == 1 and out["refused"] == 1, out
+    out2, _ = m.zoho_audit_pack({"module": "Leads"}, {})
+    assert out2["entries"] == 1 and out2["applied"] == 1, out2
+    try:
+        m.zoho_audit_pack({"outcome": "maybe"}, {})
+        assert False
+    except RuntimeError as e:
+        assert "applied" in str(e), e
+
+
+def t_audit_pack_reports_a_broken_chain():
+    h, _, store = _ledger_helpers([], [])
+    m = load(h)
+    for i in range(3):
+        m._ledger_append(m._ledger_note("applied", "apply_update", "Leads",
+                                        "k%d" % i, {"records": 1}))
+    store["/tmp/rc-test/zoho_ledger.json"]["entries"][0]["module"] = "Deals"
+    out, _ = m.zoho_audit_pack({}, {})
+    assert out["chain_intact"] is False, out
+    assert "BROKEN" in out["summary"], out["summary"]
+
+
+def t_module_version_comes_from_the_docstring():
+    """The version must not gain a fourth literal home."""
+    import json as _j
+    h, _, _ = _ledger_helpers([], [])
+    m = load(h)
+    assert m._module_version() == _j.load(open(MANIFEST))["version"]
 
 
 for name, fn in sorted((k, v) for k, v in list(globals().items())
