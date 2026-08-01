@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Mocked tests for shweta/zoho-crm.
 
-Runs the handler against a fake __rc_helpers__ so every code path — including
-the retry policy, which is hard to trigger against a live org — is exercised
+Runs the handler against a fake __rc_helpers__ so every code path - including
+the retry policy, which is hard to trigger against a live org - is exercised
 without touching Zoho.
 
     python3 test_handler.py
@@ -73,9 +73,9 @@ def check(name, fn):
         fn()
         PASS.append(name)
     except AssertionError as e:
-        FAIL.append("%s — %s" % (name, e))
+        FAIL.append("%s - %s" % (name, e))
     except Exception as e:
-        FAIL.append("%s — unexpected %s: %s" % (name, type(e).__name__, e))
+        FAIL.append("%s - unexpected %s: %s" % (name, type(e).__name__, e))
 
 
 # ---------------------------------------------------------------- validation
@@ -291,7 +291,7 @@ def t_no_env_reads():
 
 
 def t_4xx_not_retried():
-    """A 401 is deterministic — it must fail on the first attempt, not the fifth."""
+    """A 401 is deterministic - it must fail on the first attempt, not the fifth."""
     h, calls = helpers([], raise_http=(401, '{"code":"OAUTH_SCOPE_MISMATCH"}'))
     m = load(h)
     try:
@@ -325,7 +325,7 @@ def t_404_not_retried():
 
 
 def t_convert_lead_parses_details():
-    """Zoho nests created records under details.<Module>.id — verified live."""
+    """Zoho nests created records under details.<Module>.id - verified live."""
     h, _ = helpers([(200, {"data": [{
         "code": "SUCCESS",
         "message": "The record has been converted successfully",
