@@ -464,7 +464,7 @@ precisely what makes a pack worth reading. A human opens the file.
   "refused": 3,
   "records_changed": 0,
   "chain_intact": true,
-  "summary": "Wrote 3 ledger entries to audit_pack.20260801T071029Z.json — 0 applied, 3 refused, 0 records changed. Chain intact. Refusals are the useful half: they are the evidence the control fired."
+  "summary": "Wrote 3 ledger entries to audit_pack.20260801T071029Z.json - 0 applied, 3 refused, 0 records changed. Chain intact. Refusals are the useful half: they are the evidence the control fired."
 }
 ```
 
