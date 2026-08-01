@@ -784,5 +784,7 @@
       },
       "description": "Commits a plan made by zoho.plan_rollback. A rollback is a write like any other: it re-reads, re-hashes and refuses if the records moved since the plan."
     }
-  ]
+  ],
+  "manifest_version": 2,
+  "publisher_pubkey": "be209aad9734a7e3b8b301560bcace329f26c567ca9ef0880fb8358c72ccd761"
 }
