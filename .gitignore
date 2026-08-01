@@ -5,3 +5,7 @@ module.sig
 
 __pycache__/
 *.pyc
+
+# Local probe output and captured org data - never publish.
+backup_*.json
+merge_experiment_state.json
