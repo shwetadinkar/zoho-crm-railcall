@@ -1,4 +1,4 @@
-"""shweta/zoho-crm 0.5.2
+"""shweta/zoho-crm 0.6.0
 
 Vault entry `zoho`:
 
@@ -695,9 +695,13 @@ def zoho_plan_update(inputs, stamp):
 
     ids = [str(r.get("id")) for r in matched if r.get("id")]
     # The caller's query selected whatever it liked. Read the fields we are
-    # actually about to overwrite, so the snapshot covers the right columns.
-    current = _read_by_ids(module, ids, fields)
-    fingerprint, snapshot = _fingerprint(module, current, fields)
+    # about to overwrite, plus Modified_Time as a guard: hashing only the
+    # written fields means an edit to any other column on a matched record
+    # leaves the fingerprint unchanged and the write lands on state nobody
+    # reviewed. Modified_Time is read and hashed, never written.
+    guard = sorted(set(fields) | {"Modified_Time"})
+    current = _read_by_ids(module, ids, guard)
+    fingerprint, snapshot = _fingerprint(module, current, guard)
 
     would_change = sum(
         1 for row in snapshot
@@ -766,10 +770,17 @@ def zoho_apply_update(inputs, stamp):
                            "per write." % len(matched))
 
     ids = [str(r.get("id")) for r in matched if r.get("id")]
-    current = _read_by_ids(module, ids, fields)
-    actual, snapshot = _fingerprint(module, current, fields)
+    guard = sorted(set(fields) | {"Modified_Time"})
+    current = _read_by_ids(module, ids, guard)
+    actual, snapshot = _fingerprint(module, current, guard)
 
     if actual != expected:
+        _ledger_append(_ledger_note(
+            "refused", "apply_update", module,
+            _plan_key(module, query, changes),
+            {"reason": "state moved between plan and apply",
+             "expected": expected, "actual": actual,
+             "records": len(snapshot), "fields": fields}))
         raise RuntimeError(
             "Refusing to apply. The records moved since the plan was made: "
             "%d now match the query and the state fingerprint is %s, not %s. "
@@ -786,6 +797,15 @@ def zoho_apply_update(inputs, stamp):
                         "apply plan to " + module, stamp)
     result["fingerprint_verified"] = expected
     result["records_applied"] = len(payload)
+    entry = _ledger_append(_ledger_note(
+        "applied", "apply_update", module,
+        _plan_key(module, query, changes),
+        {"records": len(payload), "fields": fields, "fingerprint": expected,
+         "changes": changes,
+         "before": [{"id": r["id"],
+                     "before": {f: r["before"].get(f) for f in fields}}
+                    for r in snapshot]}))
+    result["ledger_seq"] = entry["seq"]
     return result, None
 
 
@@ -1175,3 +1195,420 @@ def zoho_add_note(inputs, stamp):
                      body={"data": [note]})
     return _summarise(response, "add note to %s/%s" % (module, record_id),
                       stamp), None
+
+
+# =============================================================================
+# LEDGER  —  paste this block into handler.py immediately after the
+# plan / apply section (after zoho_apply_delete, before the handover section).
+#
+# Why this exists, and what it is not.
+#
+# Every governed change already produces a platform receipt. Two things those
+# receipts cannot do. First, redact_output strips identifiers before sealing,
+# so a receipt cannot answer "which records changed". Second, a refusal raises,
+# and the plan that proved it expires an hour later — so the evidence that the
+# control fired is the evidence that gets thrown away.
+#
+# This keeps a local append-only ledger of applies and refusals. Each entry
+# carries the hash of the entry before it, so removing or editing any entry
+# breaks every link after it and zoho.verify_ledger will say where.
+#
+# HONEST LIMITS, and these belong in the docs verbatim:
+#   - It records changes made THROUGH this module. Someone editing in the Zoho
+#     UI is invisible to it. It is a record of governed changes, not an audit
+#     trail of the org.
+#   - The chain is tamper-EVIDENT, not tamper-proof. Anyone who can write the
+#     file can rewrite the whole chain from any point. It proves nothing was
+#     edited in place; it does not prove nothing was replaced wholesale.
+#   - Entries hold record ids and prior field values, so the file is PII. It
+#     lives in the station workspace beside the plans.
+# =============================================================================
+
+def _module_version():
+    """Read the version off the module docstring rather than repeating it.
+
+    The version already lives in two places and has drifted apart three times.
+    A third literal in this file would be a fourth chance to get it wrong.
+    """
+    found = re.search(r"shweta/zoho-crm ([0-9.]+)", __doc__ or "")
+    return found.group(1) if found else "unknown"
+
+
+_LEDGER_FILE = "zoho_ledger.json"
+_LEDGER_MAX = 5000          # rotate past this so a single file stays readable
+_GENESIS = "sha256:" + "0" * 64
+
+
+def _ledger_path(suffix=""):
+    helpers = __rc_helpers__  # noqa: F821
+    base = str(helpers.get("WS") or "").rstrip("/") + "/" + _LEDGER_FILE
+    return base + suffix
+
+
+def _entry_hash(entry, prev):
+    """Hash an entry together with its predecessor's hash.
+
+    `entry_hash` is excluded from its own input, obviously. Canonical
+    serialisation so the same entry always hashes the same way, the same rule
+    _fingerprint follows.
+    """
+    body = {k: v for k, v in entry.items() if k != "entry_hash"}
+    blob = _json.dumps({"prev": prev, "entry": body},
+                       sort_keys=True, separators=(",", ":"), default=str)
+    return "sha256:" + hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def _ledger_load():
+    helpers = __rc_helpers__  # noqa: F821
+    book = helpers["jload"](_ledger_path(), {}) or {}
+    entries = book.get("entries")
+    return {
+        "chain_start": book.get("chain_start") or _GENESIS,
+        "entries": entries if isinstance(entries, list) else [],
+    }
+
+
+def _ledger_append(record):
+    """Append one entry and return it, chained to whatever came before.
+
+    Called on every apply — successful or refused. A refusal is the more
+    valuable of the two: it is the only direct evidence the control works.
+    """
+    helpers = __rc_helpers__  # noqa: F821
+    book = _ledger_load()
+    entries = book["entries"]
+
+    if len(entries) >= _LEDGER_MAX:
+        # Seal the current file under a timestamped name and start a fresh
+        # chain whose start is the last sealed hash, so the archive and the
+        # live file remain verifiable as one sequence.
+        stamp_name = time.strftime(".%Y%m%dT%H%M%SZ", time.gmtime())
+        helpers["jsave"](_ledger_path(stamp_name), book)
+        book = {"chain_start": entries[-1]["entry_hash"], "entries": []}
+        entries = book["entries"]
+
+    prev = entries[-1]["entry_hash"] if entries else book["chain_start"]
+    entry = dict(record)
+    entry["seq"] = len(entries) + 1
+    entry["at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    entry["prev"] = prev
+    entry["entry_hash"] = _entry_hash(entry, prev)
+
+    entries.append(entry)
+    helpers["jsave"](_ledger_path(), book)
+    return entry
+
+
+def _ledger_verify():
+    """Walk the chain and report the first entry that does not hold.
+
+    Returns (intact, checked, first_bad_seq_or_None).
+    """
+    book = _ledger_load()
+    prev = book["chain_start"]
+    for index, entry in enumerate(book["entries"], start=1):
+        if not isinstance(entry, dict):
+            return False, index - 1, index
+        if entry.get("prev") != prev:
+            return False, index - 1, index
+        if entry.get("entry_hash") != _entry_hash(entry, prev):
+            return False, index - 1, index
+        prev = entry["entry_hash"]
+    return True, len(book["entries"]), None
+
+
+def _ledger_note(outcome, command, module, key, detail):
+    """Build the common shape. Kept in one place so entries stay comparable."""
+    return {"outcome": outcome, "command": command, "module": module,
+            "plan_key": key, "detail": detail}
+
+
+# --- ledger commands --------------------------------------------------------
+
+def zoho_verify_ledger(inputs, stamp):
+    """Check the local change ledger has not been edited in place.
+
+    Read-only. Recomputes every link from the chain start and names the first
+    entry that fails, if any.
+    """
+    intact, checked, bad = _ledger_verify()
+    book = _ledger_load()
+    applied = sum(1 for e in book["entries"] if e.get("outcome") == "applied")
+    refused = sum(1 for e in book["entries"] if e.get("outcome") == "refused")
+
+    if intact:
+        summary = ("Ledger intact. %d entries verified, %d applied and %d "
+                   "refused. Tamper-evident, not tamper-proof: this proves no "
+                   "entry was altered in place." % (checked, applied, refused))
+    else:
+        summary = ("Ledger BROKEN at entry %d. The %d entries before it verify; "
+                   "entry %d and everything after it cannot be trusted."
+                   % (bad, checked, bad))
+
+    return {
+        "ok": True,
+        "intact": intact,
+        "entries_verified": checked,
+        "first_broken_entry": bad,
+        "applied": applied,
+        "refused": refused,
+        "covers": "changes made through this module only; edits made in the "
+                  "Zoho UI are not visible here",
+        "summary": summary,
+        "origin": _origin(stamp),
+    }, None
+
+
+def zoho_audit_pack(inputs, stamp):
+    """Write the change ledger out as a reviewable file.
+
+    Read-only. The pack is written to the station workspace and this returns
+    the path and the counts, not the contents: redact_output would strip the
+    record ids out of anything returned inline, which is the whole point of the
+    pack. A human reads the file.
+
+    inputs: since (ISO date, optional), until (ISO date, optional),
+            module (optional), outcome ('applied' | 'refused', optional)
+    """
+    helpers = __rc_helpers__  # noqa: F821
+    since = str(inputs.get("since", "")).strip()
+    until = str(inputs.get("until", "")).strip()
+    module = str(inputs.get("module", "")).strip()
+    outcome = str(inputs.get("outcome", "")).strip().lower()
+    if outcome and outcome not in ("applied", "refused"):
+        raise RuntimeError("'outcome' must be 'applied' or 'refused' if given, "
+                           "got %r." % outcome)
+
+    intact, checked, bad = _ledger_verify()
+    book = _ledger_load()
+
+    rows = []
+    for entry in book["entries"]:
+        at = str(entry.get("at") or "")
+        if since and at < since:
+            continue
+        if until and at > until:
+            continue
+        if module and entry.get("module") != module:
+            continue
+        if outcome and entry.get("outcome") != outcome:
+            continue
+        rows.append(entry)
+
+    pack = {
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "module_version": _module_version(),
+        "filter": {"since": since or None, "until": until or None,
+                   "module": module or None, "outcome": outcome or None},
+        "chain": {"intact": intact, "entries_verified": checked,
+                  "first_broken_entry": bad,
+                  "chain_start": book["chain_start"]},
+        "scope_note": ("Records changes made through shweta/zoho-crm. Edits "
+                       "made directly in the Zoho UI are not represented."),
+        "counts": {
+            "entries": len(rows),
+            "applied": sum(1 for r in rows if r.get("outcome") == "applied"),
+            "refused": sum(1 for r in rows if r.get("outcome") == "refused"),
+            "records_changed": sum(int(r.get("detail", {}).get("records") or 0)
+                                   for r in rows if r.get("outcome") == "applied"),
+        },
+        "entries": rows,
+    }
+
+    name = "audit_pack" + time.strftime(".%Y%m%dT%H%M%SZ", time.gmtime()) + ".json"
+    path = str(helpers.get("WS") or "").rstrip("/") + "/" + name
+    helpers["jsave"](path, pack)
+
+    return {
+        "ok": True,
+        "pack_path": path,
+        "entries": pack["counts"]["entries"],
+        "applied": pack["counts"]["applied"],
+        "refused": pack["counts"]["refused"],
+        "records_changed": pack["counts"]["records_changed"],
+        "chain_intact": intact,
+        "summary": ("Wrote %d ledger entries to %s — %d applied, %d refused, "
+                    "%d records changed. Chain %s. Refusals are the useful half: "
+                    "they are the evidence the control fired."
+                    % (pack["counts"]["entries"], name,
+                       pack["counts"]["applied"], pack["counts"]["refused"],
+                       pack["counts"]["records_changed"],
+                       "intact" if intact else "BROKEN at entry %d" % bad)),
+        "origin": _origin(stamp),
+    }, None
+
+
+# --- rollback ---------------------------------------------------------------
+#
+# The listing has always said the plan snapshot doubles as rollback data. It
+# did, and nothing consumed it. This does.
+#
+# No rollback token is issued, deliberately. A token would be an identifier and
+# redact_output would strip it out of the receipt, which is the same trap the
+# plan store was built to avoid. Instead a rollback is addressed by the same
+# module / query / changes the operator already typed to apply it — they know
+# those three, and the ledger is keyed on them.
+
+def _last_applied(key):
+    book = _ledger_load()
+    for entry in reversed(book["entries"]):
+        if entry.get("plan_key") == key and entry.get("outcome") == "applied":
+            return entry
+    return None
+
+
+def _rollback_key(module, query, changes):
+    return _plan_key(module, query, changes)
+
+
+def zoho_plan_rollback(inputs, stamp):
+    """Work out what undoing the last apply of this change would restore.
+
+    Read-only. Takes the same module, query and changes that were applied.
+    Reads the records back as they are now and reports, per record, what it
+    would put back and whether that record has moved again since the apply.
+
+    Fields written by the original apply are restored. Modified_Time is read
+    for drift only and never written.
+    """
+    module = _module_name(inputs)
+    query = str(inputs.get("query", "")).strip()
+    changes = inputs.get("changes")
+    if not isinstance(changes, dict) or not changes:
+        raise RuntimeError("'changes' must be the same changes object that was "
+                           "applied.")
+
+    entry = _last_applied(_rollback_key(module, query, changes))
+    if not entry:
+        raise RuntimeError(
+            "No applied change in the ledger for this module, query and "
+            "changes. Rollback addresses an apply by the same three inputs "
+            "that performed it. Run zoho.audit_pack to see what is on record.")
+
+    before = entry.get("detail", {}).get("before") or []
+    if not before:
+        raise RuntimeError(
+            "The ledger entry for that apply carries no prior values, so there "
+            "is nothing to restore. Entries written before 0.6.0 do not hold "
+            "them.")
+
+    fields = sorted(str(k) for k in changes)
+    ids = [str(r.get("id")) for r in before if r.get("id")]
+    guard = sorted(set(fields) | {"Modified_Time"})
+    current = _read_by_ids(module, ids, guard)
+    by_id = {str(r.get("id")): r for r in current}
+
+    restores, missing, moved_again = [], [], []
+    for row in before:
+        rid = str(row.get("id"))
+        now = by_id.get(rid)
+        if now is None:
+            missing.append(rid)
+            continue
+        # What the apply wrote is what should be there now. If it isn't, the
+        # record has been changed again by someone else and a blind restore
+        # would silently discard their edit.
+        touched = [f for f in fields if now.get(f) != changes[f]]
+        if touched:
+            moved_again.append({"id": rid, "fields": touched})
+        restores.append({"id": rid,
+                         "restore_to": {f: row.get("before", {}).get(f)
+                                        for f in fields}})
+
+    fingerprint, _snapshot = _fingerprint(module, current, guard)
+    _plan_save(_plan_key(module, query, {"__rollback__": changes}),
+               {"fingerprint": fingerprint, "count": len(restores),
+                "records": restores})
+
+    return {
+        "ok": True,
+        "module": module,
+        "applied_at": entry.get("at"),
+        "records": restores,
+        "count": len(restores),
+        "missing": missing,
+        "changed_again": moved_again,
+        "fields": fields,
+        "expires_in_minutes": _PLAN_TTL // 60,
+        "summary": ("Would restore %d records on %s to their values before the "
+                    "apply of %s. %d have been changed again since and %d no "
+                    "longer exist; apply_rollback refuses while any record has "
+                    "moved. Run zoho.apply_rollback with the same three inputs."
+                    % (len(restores), ", ".join(fields), entry.get("at"),
+                       len(moved_again), len(missing))),
+        "origin": _origin(stamp),
+    }, None
+
+
+def zoho_apply_rollback(inputs, stamp):
+    """Restore the prior values, if nothing has moved since the plan.
+
+    Same contract as apply_update: re-read, re-hash, refuse on drift. A
+    rollback is a write like any other and gets no special dispensation —
+    undoing onto records somebody has since edited is the exact failure this
+    module exists to stop.
+    """
+    module = _module_name(inputs)
+    query = str(inputs.get("query", "")).strip()
+    changes = inputs.get("changes")
+    if not isinstance(changes, dict) or not changes:
+        raise RuntimeError("'changes' must match the rollback plan's changes.")
+
+    key = _plan_key(module, query, {"__rollback__": changes})
+    stored = _plan_load(key)
+    if not stored:
+        raise RuntimeError(
+            "No current rollback plan for these inputs. Run "
+            "zoho.plan_rollback first, review what it reports, then apply with "
+            "exactly the same three inputs. Plans expire after %d minutes."
+            % (_PLAN_TTL // 60))
+
+    fields = sorted(str(k) for k in changes)
+    guard = sorted(set(fields) | {"Modified_Time"})
+    ids = [str(r["id"]) for r in stored.get("records") or [] if r.get("id")]
+    if not ids:
+        raise RuntimeError("The rollback plan restores no records.")
+    if len(ids) > 100:
+        raise RuntimeError("The rollback covers %d records, over Zoho's 100 "
+                           "per write." % len(ids))
+
+    current = _read_by_ids(module, ids, guard)
+    actual, _snapshot = _fingerprint(module, current, guard)
+    expected = str(stored.get("fingerprint") or "")
+
+    if actual != expected:
+        _ledger_append(_ledger_note(
+            "refused", "apply_rollback", module, key,
+            {"reason": "state moved between plan and apply",
+             "expected": expected, "actual": actual,
+             "records": len(ids)}))
+        raise RuntimeError(
+            "Refusing to roll back. The records moved since the rollback plan "
+            "was made: the state fingerprint is %s, not %s. Re-run "
+            "zoho.plan_rollback and review the new plan."
+            % (actual[:23] + "...", expected[:23] + "..."))
+
+    payload = []
+    for row in stored["records"]:
+        record = {"id": row["id"]}
+        record.update(row.get("restore_to") or {})
+        payload.append(record)
+
+    result = _summarise(_call("PUT", module, body={"data": payload}),
+                        "roll back " + module, stamp)
+    result["fingerprint_verified"] = expected
+    result["records_restored"] = len(payload)
+
+    # Record what was actually there before this restore, not placeholders, so
+    # a rollback is itself reversible. `current` was read moments ago and the
+    # fingerprint proves it is still accurate.
+    now_by_id = {str(r.get("id")): r for r in current}
+    entry = _ledger_append(_ledger_note(
+        "applied", "apply_rollback", module, key,
+        {"records": len(payload), "fields": fields,
+         "fingerprint": expected,
+         "before": [{"id": r["id"],
+                     "before": {f: (now_by_id.get(r["id"], {}) or {}).get(f)
+                                for f in fields}} for r in payload]}))
+    result["ledger_seq"] = entry["seq"]
+    return result, None
