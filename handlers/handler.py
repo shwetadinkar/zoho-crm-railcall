@@ -1198,7 +1198,7 @@ def zoho_add_note(inputs, stamp):
 
 
 # =============================================================================
-# LEDGER  —  paste this block into handler.py immediately after the
+# LEDGER  -  paste this block into handler.py immediately after the
 # plan / apply section (after zoho_apply_delete, before the handover section).
 #
 # Why this exists, and what it is not.
@@ -1206,7 +1206,7 @@ def zoho_add_note(inputs, stamp):
 # Every governed change already produces a platform receipt. Two things those
 # receipts cannot do. First, redact_output strips identifiers before sealing,
 # so a receipt cannot answer "which records changed". Second, a refusal raises,
-# and the plan that proved it expires an hour later — so the evidence that the
+# and the plan that proved it expires an hour later - so the evidence that the
 # control fired is the evidence that gets thrown away.
 #
 # This keeps a local append-only ledger of applies and refusals. Each entry
@@ -1271,7 +1271,7 @@ def _ledger_load():
 def _ledger_append(record):
     """Append one entry and return it, chained to whatever came before.
 
-    Called on every apply — successful or refused. A refusal is the more
+    Called on every apply - successful or refused. A refusal is the more
     valuable of the two: it is the only direct evidence the control works.
     """
     helpers = __rc_helpers__  # noqa: F821
@@ -1427,7 +1427,7 @@ def zoho_audit_pack(inputs, stamp):
         "refused": pack["counts"]["refused"],
         "records_changed": pack["counts"]["records_changed"],
         "chain_intact": intact,
-        "summary": ("Wrote %d ledger entries to %s — %d applied, %d refused, "
+        "summary": ("Wrote %d ledger entries to %s - %d applied, %d refused, "
                     "%d records changed. Chain %s. Refusals are the useful half: "
                     "they are the evidence the control fired."
                     % (pack["counts"]["entries"], name,
@@ -1446,7 +1446,7 @@ def zoho_audit_pack(inputs, stamp):
 # No rollback token is issued, deliberately. A token would be an identifier and
 # redact_output would strip it out of the receipt, which is the same trap the
 # plan store was built to avoid. Instead a rollback is addressed by the same
-# module / query / changes the operator already typed to apply it — they know
+# module / query / changes the operator already typed to apply it - they know
 # those three, and the ledger is keyed on them.
 
 def _last_applied(key):
@@ -1544,7 +1544,7 @@ def zoho_apply_rollback(inputs, stamp):
     """Restore the prior values, if nothing has moved since the plan.
 
     Same contract as apply_update: re-read, re-hash, refuse on drift. A
-    rollback is a write like any other and gets no special dispensation —
+    rollback is a write like any other and gets no special dispensation -
     undoing onto records somebody has since edited is the exact failure this
     module exists to stop.
     """
