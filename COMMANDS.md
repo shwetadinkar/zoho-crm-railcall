@@ -783,6 +783,45 @@ rollback apply. Re-plan and review.
 **"matches more than 2000 records"** - a scan refuses rather than acting on a
 partial set. Narrow the query.
 
+# Capping how often a write can run
+
+Every write command here stops at the airlock, but nothing stops a runaway
+client from approving and firing the same command a thousand times. The
+station caps that, and the cap is yours to set.
+
+Create or edit `rate_limits.json` in the station workspace:
+
+```
+~/.railcall/station/.railcall_workspace/rate_limits.json
+```
+
+```json
+{
+  "zoho.apply_delete":   {"per_day": 5},
+  "zoho.apply_handover": {"per_day": 3},
+  "zoho.apply_update":   {"per_day": 20},
+  "zoho.apply_rollback": {"per_day": 20},
+  "zoho.delete_record":  {"per_day": 10}
+}
+```
+
+Counters roll over at UTC midnight. Setting `per_day` to `0` disables that
+command for the rest of the day, which is a usable panic switch.
+
+A blocked attempt comes back as `blocked_by_policy`, and **the approval is not
+consumed**. Raise the cap and the same approval still executes; you do not have
+to review the change again.
+
+Read-only commands are not capped.
+
+The station ships defaults for its built-in commands only. A module's commands
+have no cap until you write one, so if you care about a ceiling on
+`apply_delete` or `apply_handover`, set it deliberately rather than assuming
+one exists.
+
+Verified on station v0.44.
+
+
 # Limits
 
 100 records per write call. 200 per COQL page, paged automatically to 2000.
