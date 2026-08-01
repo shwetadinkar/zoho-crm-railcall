@@ -1,2 +1,7 @@
 __pycache__/
 *.pyc
+probe_v7.py
+probe_merge.py
+merge_experiment.py
+merge_experiment_state.json
+backup_*.json
