@@ -783,6 +783,35 @@ rollback apply. Re-plan and review.
 **"matches more than 2000 records"** - a scan refuses rather than acting on a
 partial set. Narrow the query.
 
+# What this module is allowed to call
+
+The manifest carries an empty `allowed_destinations` array:
+
+```json
+"allowed_destinations": []
+```
+
+That is a declaration, not a restriction being accepted. This module talks to
+one place - the Zoho CRM REST API, over urllib - and calls no language model,
+no gateway, and no third party. The empty array says exactly that.
+
+It matters because of how the station reads the field. A module with **no**
+`allowed_destinations` entry is treated as unrestricted, for backward
+compatibility with everything published before station v0.45. An **empty**
+array resolves to an empty set of permitted hosts. Silence and an empty
+declaration are not the same claim, and this module makes the second one.
+
+The manifest is signed at publish time, so the declaration is covered by the
+module signature. A publisher cannot claim after the fact to have declared
+something they did not.
+
+Being precise about the limits: the check runs inside `station.llm.complete()`,
+which this module never calls, so nothing here will ever exercise it at
+runtime. The value is that a reviewer reading the manifest can see the claim
+and verify it against the signature. It is a contract about intent, not a
+sandbox.
+
+
 # Capping how often a write can run
 
 Every write command here stops at the airlock, but nothing stops a runaway

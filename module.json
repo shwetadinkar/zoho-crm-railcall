@@ -1,7 +1,7 @@
 {
   "id": "shweta/zoho-crm",
   "name": "zoho-crm",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "provider": "zoho",
   "homepage": "https://github.com/shwetadinkar/zoho-crm-railcall",
   "tests_url": "https://github.com/shwetadinkar/zoho-crm-railcall/blob/main/test_handler.py",
@@ -25,6 +25,7 @@
   "requires": {
     "subprocess": false
   },
+  "allowed_destinations": [],
   "commands": [
     {
       "id": "zoho.verify_connection",

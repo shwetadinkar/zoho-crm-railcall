@@ -32,9 +32,9 @@ ZohoCRM.modules.ALL,ZohoCRM.settings.fields.READ,ZohoCRM.users.READ,ZohoCRM.coql
 
 Exchange the grant code for a refresh token, then save a vault entry named `zoho` holding `refresh_token`, `client_id`, `client_secret`, `token_url` and `instance_url`.
 
-Swap `.in` for your region: a token minted in one datacenter will not authenticate against another. Nothing is read from the process environment.
+Swap `.in` for your region: a token minted in one datacenter will not authenticate against another.
 
-Run `zoho.verify_connection` first. It probes every scope and names any that are missing and which commands they block, so a bad setup surfaces immediately.
+Run `zoho.verify_connection` first. It probes every scope and names any missing one plus the commands it blocks, so a bad setup surfaces at once.
 
 ## Example
 
@@ -57,8 +57,8 @@ Every command, with examples, errors and COQL gotchas: [COMMANDS.md](COMMANDS.md
 
 ## Limits
 
-100 records per write call, 2000 per scan before it refuses rather than half-reporting. Deletes go to the recycle bin, recoverable 60 days; rollback covers updates, not deletes. Bulk and Notification APIs, Activities, attachments and tags are not covered. The manifest declares `subprocess: false`; enforcement is at the Python import layer, not a container.
+100 records per write call, 2000 per scan before it refuses rather than half-reports. Deletes go to the recycle bin for 60 days; rollback covers updates only. Bulk and Notification APIs, Activities, attachments and tags are not covered. The manifest declares `subprocess: false` and an empty `allowed_destinations`, which is a signed declaration that this module makes no LLM calls at all. Subprocess enforcement is at the Python import layer, not a container.
 
-Any write can be capped per day in the station's `rate_limits.json`. Module commands have no cap until you set one, and a blocked attempt does not consume its approval.
+Any write can be capped per day in the station's `rate_limits.json`; a blocked attempt does not consume its approval.
 
 Tested against Zoho CRM v8. All twenty-two commands run against a live org.
