@@ -9,3 +9,5 @@ __pycache__/
 # Local probe output and captured org data - never publish.
 backup_*.json
 merge_experiment_state.json
+merge_experiment.py
+apply_061.py
