@@ -1,7 +1,7 @@
 {
   "id": "shweta/zoho-crm",
   "name": "zoho-crm",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "provider": "zoho",
   "homepage": "https://github.com/shwetadinkar/zoho-crm-railcall",
   "tests_url": "https://github.com/shwetadinkar/zoho-crm-railcall/blob/main/test_handler.py",
@@ -32,7 +32,7 @@
       "title": "Preflight: check every scope this module needs",
       "provider": "zoho",
       "risk": "low",
-      "mode": "read_only",
+      "mode": "read",
       "requires": [
         "ZOHO_OAUTH"
       ],
@@ -54,7 +54,7 @@
       "title": "List the fields on a Zoho CRM module",
       "provider": "zoho",
       "risk": "low",
-      "mode": "read_only",
+      "mode": "read",
       "requires": [
         "ZOHO_OAUTH"
       ],
@@ -78,7 +78,7 @@
       "title": "Run a read-only COQL query",
       "provider": "zoho",
       "risk": "low",
-      "mode": "read_only",
+      "mode": "read",
       "requires": [
         "ZOHO_OAUTH"
       ],
@@ -101,7 +101,7 @@
       "title": "Page through records in a module",
       "provider": "zoho",
       "risk": "low",
-      "mode": "read_only",
+      "mode": "read",
       "requires": [
         "ZOHO_OAUTH"
       ],
@@ -150,7 +150,7 @@
       "title": "Fetch one record by id",
       "provider": "zoho",
       "risk": "low",
-      "mode": "read_only",
+      "mode": "read",
       "requires": [
         "ZOHO_OAUTH"
       ],
@@ -183,7 +183,7 @@
       "title": "List org users and their ids",
       "provider": "zoho",
       "risk": "low",
-      "mode": "read_only",
+      "mode": "read",
       "requires": [
         "ZOHO_OAUTH"
       ],
@@ -214,7 +214,7 @@
       "title": "Plan a bulk update and fingerprint the current state",
       "provider": "zoho",
       "risk": "low",
-      "mode": "read_only",
+      "mode": "read",
       "requires": [
         "ZOHO_OAUTH"
       ],
@@ -290,7 +290,7 @@
       "title": "Work out what a bulk delete would remove",
       "provider": "zoho",
       "risk": "low",
-      "mode": "read_only",
+      "mode": "read",
       "requires": [
         "ZOHO_OAUTH"
       ],
@@ -351,7 +351,7 @@
       "title": "Count everything one user owns, before moving any of it",
       "provider": "zoho",
       "risk": "low",
-      "mode": "read_only",
+      "mode": "read",
       "requires": [
         "ZOHO_OAUTH"
       ],
@@ -648,7 +648,7 @@
       "title": "Check the local change ledger has not been altered",
       "provider": "zoho",
       "risk": "low",
-      "mode": "read_only",
+      "mode": "read",
       "requires": [
         "ZOHO_OAUTH"
       ],
@@ -671,7 +671,7 @@
       "title": "Write the change ledger out as a reviewable file",
       "provider": "zoho",
       "risk": "low",
-      "mode": "read_only",
+      "mode": "read",
       "requires": [
         "ZOHO_OAUTH"
       ],
@@ -715,7 +715,7 @@
       "title": "Plan an undo of a previously applied bulk update",
       "provider": "zoho",
       "risk": "low",
-      "mode": "read_only",
+      "mode": "read",
       "requires": [
         "ZOHO_OAUTH"
       ],
