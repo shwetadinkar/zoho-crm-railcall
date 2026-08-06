@@ -1,0 +1,159 @@
+{
+  "id": "shweta/governed-handover",
+  "name": "shweta_governed_handover",
+  "title": "Governed handover when someone leaves",
+  "kind": "canvas",
+  "status": "CANVAS",
+  "author": "shweta",
+  "tag": "governed CRM",
+  "desc": "Somebody leaves the company. This workflow reports everything they own across Leads, Deals, Contacts and Accounts, waits for one human approval, reassigns the whole book in a single governed batch, and confirms the change is recorded in a tamper-evident ledger.\n\nThe point is the middle step. plan_handover fingerprints the exact set of records it is about to move. apply_handover re-reads that set, re-hashes it, and REFUSES if anything moved while the approval was sitting in the queue - so a record edited between review and execution stops the write rather than being silently swept up in it. A CRM has no undo, and this is the gap that ordinary automation leaves open.\n\nEvery step runs through the RailCall airlock and produces a signed receipt. The final step verifies the local change ledger, which is hash-chained: each entry carries the fingerprint of the one before it, so editing or removing an entry breaks every link after it.\n\nHonest about limits: the ledger is tamper-EVIDENT, not tamper-proof, and it records changes made through this module only. Somebody editing directly in the Zoho UI is invisible to it.\n\nTrigger contract: supply from_user and to_user as email addresses of Zoho CRM users.\n\nDependencies: requires shweta/zoho-crm v0.6.1 or later, with the zoho vault entry configured (client_id, client_secret, refresh_token, token_url, instance_url). Run zoho.verify_connection first - it names any missing scope and which commands it blocks. [contest:2026Q3]",
+  "trigger": "manual",
+  "capabilities": {
+    "max_spend_cents": 0
+  },
+  "steps": [
+    {
+      "id": "plan",
+      "label": "Count everything one user owns",
+      "command_id": "shweta/zoho-crm.plan_handover",
+      "inputs_template": {
+        "from_user": "{{ctx.from_user}}",
+        "to_user": "{{ctx.to_user}}"
+      }
+    },
+    {
+      "id": "apply",
+      "label": "Reassign the planned set, refusing on drift",
+      "command_id": "shweta/zoho-crm.apply_handover",
+      "inputs_template": {
+        "from_user": "{{ctx.from_user}}",
+        "to_user": "{{ctx.to_user}}"
+      }
+    },
+    {
+      "id": "verify",
+      "label": "Check the change ledger has not been altered",
+      "command_id": "shweta/zoho-crm.verify_ledger",
+      "inputs_template": {}
+    }
+  ],
+  "nodes": [
+    {
+      "id": "plan",
+      "label": "Count everything one user owns",
+      "command_id": "shweta/zoho-crm.plan_handover"
+    },
+    {
+      "id": "apply",
+      "label": "Reassign the planned set, refusing on drift",
+      "command_id": "shweta/zoho-crm.apply_handover"
+    },
+    {
+      "id": "verify",
+      "label": "Check the change ledger has not been altered",
+      "command_id": "shweta/zoho-crm.verify_ledger"
+    }
+  ],
+  "edges": [
+    {
+      "from": "plan",
+      "to": "apply"
+    },
+    {
+      "from": "apply",
+      "to": "verify"
+    }
+  ],
+  "canvas_spec": {
+    "nodes": [
+      {
+        "id": "plan",
+        "type": "effect",
+        "x": 80,
+        "y": 120,
+        "action_id": "zoho_plan_handover",
+        "action_title": "Count everything one user owns, before moving any of it",
+        "provider": "zoho",
+        "args": {
+          "from_user": "{{ctx.from_user}}",
+          "to_user": "{{ctx.to_user}}"
+        }
+      },
+      {
+        "id": "apply",
+        "type": "effect",
+        "x": 420,
+        "y": 120,
+        "action_id": "zoho_apply_handover",
+        "action_title": "Reassign the planned set, refusing if anything has moved since",
+        "provider": "zoho",
+        "args": {
+          "from_user": "{{ctx.from_user}}",
+          "to_user": "{{ctx.to_user}}"
+        }
+      },
+      {
+        "id": "verify",
+        "type": "effect",
+        "x": 760,
+        "y": 120,
+        "action_id": "zoho_verify_ledger",
+        "action_title": "Check the local change ledger has not been altered",
+        "provider": "zoho",
+        "args": {}
+      }
+    ],
+    "edges": [
+      {
+        "from": "plan",
+        "to": "apply"
+      },
+      {
+        "from": "apply",
+        "to": "verify"
+      }
+    ]
+  },
+  "engine_spec": {
+    "id": "shweta_governed_handover",
+    "title": "Governed handover when someone leaves",
+    "context": {
+      "from_user": "REPLACE-WITH-DEPARTING-USER-EMAIL",
+      "to_user": "REPLACE-WITH-RECEIVING-USER-EMAIL"
+    },
+    "nodes": [
+      {
+        "id": "plan",
+        "type": "effect",
+        "branch": "review",
+        "action_id": "zoho_plan_handover",
+        "provider": "zoho",
+        "args": {
+          "from_user": "{{ctx.from_user}}",
+          "to_user": "{{ctx.to_user}}"
+        }
+      },
+      {
+        "id": "apply",
+        "type": "effect",
+        "branch": "commit",
+        "parent": "plan",
+        "action_id": "zoho_apply_handover",
+        "provider": "zoho",
+        "args": {
+          "from_user": "{{ctx.from_user}}",
+          "to_user": "{{ctx.to_user}}"
+        }
+      },
+      {
+        "id": "verify",
+        "type": "effect",
+        "branch": "evidence",
+        "parent": "apply",
+        "action_id": "zoho_verify_ledger",
+        "provider": "zoho",
+        "args": {}
+      }
+    ]
+  }
+}
