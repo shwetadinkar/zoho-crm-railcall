@@ -870,7 +870,7 @@ def t_every_high_risk_write_has_a_plan_step():
     import json as _j
     m = _j.load(open(MANIFEST))
     planned = {"zoho.apply_update", "zoho.apply_delete", "zoho.apply_handover",
-               "zoho.apply_rollback"}
+               "zoho.apply_rollback", "zoho.apply_merge", "zoho.apply_upsert"}
     by_id = {"zoho.delete_record", "zoho.convert_lead", "zoho.update_record"}
     high = {c["id"] for c in m["commands"]
             if c.get("risk") == "high" and c.get("mode") == "write_requires_approval"}
@@ -1336,6 +1336,623 @@ def t_module_version_comes_from_the_docstring():
     h, _, _ = _ledger_helpers([], [])
     m = load(h)
     assert m._module_version() == _j.load(open(MANIFEST))["version"]
+
+
+
+# --------------------------------------------------------------------- merge
+def _merge_helpers(records, related=None, store=None):
+    """Fake for the merge path.
+
+    GET  {module}/{id}          -> the full record, from `records`
+    POST coql                   -> id lookups and related-list queries
+    POST {m}/{id}/actions/merge -> SUCCESS
+
+    `records` maps id -> field dict. `related` maps id -> row count for every
+    related list, defaulting to none attached.
+    """
+    calls = []
+    store = store if store is not None else {}
+    related = related or {}
+
+    def _get(url, **k):
+        calls.append(("GET", url))
+        rid = url.rstrip("/").rsplit("/", 1)[-1]
+        rec = records.get(rid)
+        return 200, json.dumps({"data": [rec] if rec else []}).encode()
+
+    def _post(url, obj, **k):
+        calls.append(("POST", url))
+        if url.endswith("/actions/merge"):
+            return 200, json.dumps({"merge": [{"code": "SUCCESS"}]}).encode()
+        q = (obj or {}).get("select_query", "")
+        if " in (" in q:                       # _read_by_ids
+            rows = [dict(v, id=k) for k, v in records.items() if k in q]
+            return 200, json.dumps({"data": rows}).encode()
+        for rid, n in related.items():         # related-list count
+            if rid in q:
+                return 200, json.dumps(
+                    {"data": [{"id": "r%d" % i} for i in range(n)]}).encode()
+        return 200, json.dumps({"data": []}).encode()
+
+    return {"oauth_refresh": lambda p, **k: {"access_token": "t",
+                                             "instance_url": "https://x"},
+            "http_get_json": _get,
+            "http_post_json": _post,
+            "http_patch_json": lambda u, d, **k: (200, b"{}"),
+            "http_delete_json": lambda u, **k: (200, b"{}"),
+            "WS": "/tmp/rc-test",
+            "jload": lambda path, default=None: store.get(path, default if default is not None else {}),
+            "jsave": lambda path, obj: store.__setitem__(path, obj)}, calls, store
+
+
+_M_ARGS = {"module": "Leads", "master_id": "100", "loser_ids": ["200"]}
+
+
+def t_merge_rejects_unverified_modules():
+    """Merge is verified on Leads and Contacts. It must not guess elsewhere."""
+    h, _, _ = _merge_helpers({})
+    m = load(h)
+    for mod in ("Accounts", "Deals"):
+        try:
+            m.zoho_plan_merge({"module": mod, "master_id": "1",
+                               "loser_ids": ["2"]}, {})
+            assert False, mod + " should be rejected"
+        except RuntimeError as e:
+            assert "verified on" in str(e), e
+
+
+def t_merge_rejects_self_and_duplicates():
+    h, _, _ = _merge_helpers({})
+    m = load(h)
+    for args, want in (
+        ({"module": "Leads", "master_id": "1", "loser_ids": ["1"]}, "into itself"),
+        ({"module": "Leads", "master_id": "1", "loser_ids": ["2", "2"]}, "duplicates"),
+        ({"module": "Leads", "master_id": "1", "loser_ids": []}, "required"),
+        ({"module": "Leads", "master_id": "", "loser_ids": ["2"]}, "required"),
+    ):
+        try:
+            m.zoho_plan_merge(args, {})
+            assert False, args
+        except RuntimeError as e:
+            assert want in str(e), (args, str(e))
+
+
+def t_merge_caps_losers_per_call():
+    h, _, _ = _merge_helpers({})
+    m = load(h)
+    try:
+        m.zoho_plan_merge({"module": "Leads", "master_id": "1",
+                           "loser_ids": ["2", "3", "4", "5"]}, {})
+        assert False
+    except RuntimeError as e:
+        assert "per call" in str(e), e
+
+
+def t_merge_conflicts_filters_system_stamps():
+    """A live preview showed 4 of 7 conflicts were Created_Time, Modified_Time,
+    Last_Activity_Time and Change_Log_Time__s. Nobody can act on those, and
+    they bury the ones who can."""
+    records = {
+        "100": {"id": "100", "Phone": "111", "Created_Time": "t1",
+                "Modified_Time": "t1", "Last_Activity_Time": "t1",
+                "Change_Log_Time__s": "t1", "$editable": True,
+                "Full_Name": "A"},
+        "200": {"id": "200", "Phone": "222", "Created_Time": "t2",
+                "Modified_Time": "t2", "Last_Activity_Time": "t2",
+                "Change_Log_Time__s": "t2", "$editable": False,
+                "Full_Name": "B"},
+    }
+    h, _, _ = _merge_helpers(records)
+    m = load(h)
+    out, _ = m.zoho_plan_merge(_M_ARGS, {})
+    loser = out["losers"][0]
+    fields = {c["field"] for c in loser["conflicts"]}
+    assert fields == {"Phone", "Full_Name"}, fields
+    for noise in ("Created_Time", "Modified_Time", "Last_Activity_Time",
+                  "Change_Log_Time__s", "$editable"):
+        assert noise not in fields, noise
+    # filtered, not silently dropped
+    assert loser["system_fields_differing"] >= 4, loser
+
+
+def t_plan_merge_reports_what_is_lost():
+    """The conflict list is the product: the master wins silently."""
+    records = {
+        "100": {"id": "100", "Last_Name": "Ada", "Phone": "111",
+                "Modified_Time": "t1"},
+        "200": {"id": "200", "Last_Name": "Ada", "Phone": "222",
+                "Email": "ada@x.com", "Modified_Time": "t1"},
+    }
+    h, _, _ = _merge_helpers(records, related={"200": 3})
+    m = load(h)
+    out, err = m.zoho_plan_merge(_M_ARGS, {})
+    assert err is None
+    loser = out["losers"][0]
+    conflicts = {c["field"]: (c["master"], c["loser"]) for c in loser["conflicts"]}
+    assert conflicts["Phone"] == ("111", "222"), conflicts
+    assert "Last_Name" not in conflicts, "identical values are not conflicts"
+    only = {o["field"] for o in loser["only_on_loser"]}
+    assert "Email" in only, only
+    assert out["irreversible"] is True
+    assert "cannot be recovered" in out["summary"], out["summary"]
+
+
+def t_plan_merge_counts_related_records():
+    records = {"100": {"id": "100", "Modified_Time": "t1"},
+               "200": {"id": "200", "Modified_Time": "t1"}}
+    h, _, _ = _merge_helpers(records, related={"200": 4})
+    m = load(h)
+    out, _ = m.zoho_plan_merge(_M_ARGS, {})
+    rel = out["losers"][0]["related"]
+    assert rel["Notes"]["count"] == 4, rel
+    assert out["related_records_moving"] >= 4, out["related_records_moving"]
+
+
+def t_plan_merge_raises_on_missing_record():
+    records = {"100": {"id": "100", "Modified_Time": "t1"}}
+    h, _, _ = _merge_helpers(records)
+    m = load(h)
+    try:
+        m.zoho_plan_merge(_M_ARGS, {})
+        assert False
+    except RuntimeError as e:
+        assert "do not exist" in str(e), e
+
+
+def t_apply_merge_without_a_plan_raises():
+    records = {"100": {"id": "100", "Modified_Time": "t1"},
+               "200": {"id": "200", "Modified_Time": "t1"}}
+    h, _, _ = _merge_helpers(records)
+    m = load(h)
+    try:
+        m.zoho_apply_merge(_M_ARGS, {})
+        assert False
+    except RuntimeError as e:
+        assert "No current plan" in str(e), e
+
+
+def t_apply_merge_refuses_on_drift():
+    records = {"100": {"id": "100", "Modified_Time": "t1"},
+               "200": {"id": "200", "Modified_Time": "t1"}}
+    h, _, store = _merge_helpers(records)
+    m = load(h)
+    m.zoho_plan_merge(_M_ARGS, {})
+
+    moved = {"100": {"id": "100", "Modified_Time": "t1"},
+             "200": {"id": "200", "Modified_Time": "t9"}}
+    h2, _, _ = _merge_helpers(moved, store=store)
+    m2 = load(h2)
+    try:
+        m2.zoho_apply_merge(_M_ARGS, {})
+        assert False, "should have refused"
+    except RuntimeError as e:
+        assert "Refusing to merge" in str(e), e
+    outcomes = [x["outcome"] for x in store["/tmp/rc-test/zoho_ledger.json"]["entries"]]
+    assert outcomes == ["refused"], outcomes
+
+
+def t_apply_merge_refuses_when_the_master_moves():
+    """The master's values are the ones that win, so its drift matters too."""
+    records = {"100": {"id": "100", "Modified_Time": "t1"},
+               "200": {"id": "200", "Modified_Time": "t1"}}
+    h, _, store = _merge_helpers(records)
+    m = load(h)
+    m.zoho_plan_merge(_M_ARGS, {})
+
+    moved = {"100": {"id": "100", "Modified_Time": "t7"},
+             "200": {"id": "200", "Modified_Time": "t1"}}
+    h2, _, _ = _merge_helpers(moved, store=store)
+    m2 = load(h2)
+    try:
+        m2.zoho_apply_merge(_M_ARGS, {})
+        assert False, "should have refused"
+    except RuntimeError as e:
+        assert "Refusing to merge" in str(e), e
+
+
+def t_apply_merge_archives_before_it_destroys():
+    """The ledger entry is the only readable copy of what was merged away."""
+    records = {"100": {"id": "100", "Phone": "111", "Modified_Time": "t1"},
+               "200": {"id": "200", "Phone": "222", "Email": "ada@x.com",
+                       "Modified_Time": "t1"}}
+    h, _, store = _merge_helpers(records, related={"200": 2})
+    m = load(h)
+    m.zoho_plan_merge(_M_ARGS, {})
+    out, err = m.zoho_apply_merge(_M_ARGS, {})
+    assert err is None
+    assert out["succeeded"] == 1 and out["failed"] == 0, out
+    assert out["recoverable"] is False, out
+
+    entries = store["/tmp/rc-test/zoho_ledger.json"]["entries"]
+    assert [e["outcome"] for e in entries] == ["applied"], entries
+    archive = entries[0]["detail"]["archive"]
+    assert archive[0]["id"] == "200", archive
+    assert archive[0]["record"]["Phone"] == "222", archive
+    assert entries[0]["detail"]["irreversible"] is True
+    # the archive must be written BEFORE the merge fires, so it is entry 1
+    assert out["ledger_seq"] == entries[0]["seq"], (out["ledger_seq"], entries)
+
+
+def t_apply_merge_calls_the_verified_endpoint_shape():
+    records = {"100": {"id": "100", "Modified_Time": "t1"},
+               "200": {"id": "200", "Modified_Time": "t1"}}
+    h, calls, _ = _merge_helpers(records)
+    m = load(h)
+    m.zoho_plan_merge(_M_ARGS, {})
+    m.zoho_apply_merge(_M_ARGS, {})
+    merge_calls = [u for meth, u in calls if u.endswith("/actions/merge")]
+    assert len(merge_calls) == 1, merge_calls
+    assert merge_calls[0].endswith("Leads/100/actions/merge"), merge_calls[0]
+
+
+def t_apply_merge_one_loser_per_call():
+    """Batching hides which record failed; a merge failure has to be legible."""
+    records = {"100": {"id": "100", "Modified_Time": "t1"},
+               "200": {"id": "200", "Modified_Time": "t1"},
+               "300": {"id": "300", "Modified_Time": "t1"}}
+    args = {"module": "Leads", "master_id": "100", "loser_ids": ["200", "300"]}
+    h, calls, _ = _merge_helpers(records)
+    m = load(h)
+    m.zoho_plan_merge(args, {})
+    out, _ = m.zoho_apply_merge(args, {})
+    merge_calls = [u for meth, u in calls if u.endswith("/actions/merge")]
+    assert len(merge_calls) == 2, merge_calls
+    assert out["succeeded"] == 2, out
+
+
+
+# -------------------------------------------------------------- bulk upsert
+def _upsert_helpers(existing_rows, store=None, upsert_result=None):
+    """COQL returns `existing_rows` for lookups; POST /upsert returns SUCCESS
+    per record unless `upsert_result` overrides it."""
+    calls = []
+    store = store if store is not None else {}
+
+    def _post(url, obj, **k):
+        calls.append(("POST", url))
+        if url.endswith("/upsert"):
+            n = len((obj or {}).get("data") or [])
+            rows = upsert_result if upsert_result is not None else [
+                {"code": "SUCCESS", "details": {"id": str(900 + i)}}
+                for i in range(n)]
+            return 200, json.dumps({"data": rows}).encode()
+        q = (obj or {}).get("select_query", "")
+        if "where id in (" in q:               # _read_by_ids, for the guard
+            rows = [r for r in existing_rows if str(r.get("id")) in q]
+        else:                                  # duplicate-check lookup
+            rows = [r for r in existing_rows
+                    if any(str(v) in q for k2, v in r.items() if k2 != "id")]
+        return 200, json.dumps({"data": rows}).encode()
+
+    return {"oauth_refresh": lambda p, **k: {"access_token": "t",
+                                             "instance_url": "https://x"},
+            "http_get_json": lambda u, **k: (200, b"{}"),
+            "http_post_json": _post,
+            "http_patch_json": lambda u, d, **k: (200, b"{}"),
+            "http_delete_json": lambda u, **k: (200, b"{}"),
+            "WS": "/tmp/rc-test",
+            "jload": lambda path, default=None: store.get(path, default if default is not None else {}),
+            "jsave": lambda path, obj: store.__setitem__(path, obj)}, calls, store
+
+
+_U_RECS = [{"Email": "a@x.com", "Last_Name": "A"},
+           {"Email": "b@x.com", "Last_Name": "B"}]
+_U_ARGS = {"module": "Leads", "records": _U_RECS,
+           "duplicate_check_fields": ["Email"]}
+
+
+def t_plan_upsert_requires_check_fields():
+    """Without them the plan cannot say which records are creates."""
+    h, _, _ = _upsert_helpers([])
+    m = load(h)
+    try:
+        m.zoho_plan_upsert({"module": "Leads", "records": _U_RECS}, {})
+        assert False
+    except RuntimeError as e:
+        assert "duplicate_check_fields" in str(e), e
+
+
+def t_plan_upsert_requires_check_field_on_every_record():
+    h, _, _ = _upsert_helpers([])
+    m = load(h)
+    try:
+        m.zoho_plan_upsert({"module": "Leads",
+                            "records": [{"Email": "a@x.com"}, {"Last_Name": "B"}],
+                            "duplicate_check_fields": ["Email"]}, {})
+        assert False
+    except RuntimeError as e:
+        assert "Missing" in str(e), e
+
+
+def t_plan_upsert_splits_creates_from_updates():
+    """The split is the whole point of the preview."""
+    existing = [{"id": "1", "Email": "a@x.com", "Modified_Time": "t1"}]
+    h, _, _ = _upsert_helpers(existing)
+    m = load(h)
+    out, err = m.zoho_plan_upsert(_U_ARGS, {})
+    assert err is None
+    assert out["total"] == 2, out
+    assert out["will_update"] == 1 and out["will_create"] == 1, out
+    assert out["updates"][0]["matched_on"] == "Email", out["updates"]
+    assert out["creates"][0]["Email"] == "b@x.com", out["creates"]
+
+
+def t_plan_upsert_states_the_narrower_drift_guarantee():
+    """A record that does not exist yet has nothing that can move, and the
+    output has to say so rather than implying plan_update's guarantee."""
+    h, _, _ = _upsert_helpers([{"id": "1", "Email": "a@x.com", "Modified_Time": "t1"}])
+    m = load(h)
+    out, _ = m.zoho_plan_upsert(_U_ARGS, {})
+    assert "no prior state" in out["drift_covers"], out["drift_covers"]
+    assert "existing records only" in out["summary"], out["summary"]
+
+
+def t_plan_upsert_reports_call_count():
+    recs = [{"Email": "u%d@x.com" % i} for i in range(250)]
+    h, _, _ = _upsert_helpers([])
+    m = load(h)
+    out, _ = m.zoho_plan_upsert({"module": "Leads", "records": recs,
+                                 "duplicate_check_fields": ["Email"]}, {})
+    assert out["calls_required"] == 3, out["calls_required"]
+    assert out["will_create"] == 250, out["will_create"]
+
+
+def t_plan_upsert_refuses_an_oversized_set():
+    recs = [{"Email": "u%d@x.com" % i} for i in range(2001)]
+    h, _, _ = _upsert_helpers([])
+    m = load(h)
+    try:
+        m.zoho_plan_upsert({"module": "Leads", "records": recs,
+                            "duplicate_check_fields": ["Email"]}, {})
+        assert False
+    except RuntimeError as e:
+        assert "half-applying" in str(e), e
+
+
+def t_apply_upsert_without_a_plan_raises():
+    h, _, _ = _upsert_helpers([])
+    m = load(h)
+    try:
+        m.zoho_apply_upsert(_U_ARGS, {})
+        assert False
+    except RuntimeError as e:
+        assert "No current plan" in str(e), e
+
+
+def t_apply_upsert_refuses_when_an_existing_record_moved():
+    existing = [{"id": "1", "Email": "a@x.com", "Modified_Time": "t1"}]
+    h, _, store = _upsert_helpers(existing)
+    m = load(h)
+    m.zoho_plan_upsert(_U_ARGS, {})
+
+    moved = [{"id": "1", "Email": "a@x.com", "Modified_Time": "t9"}]
+    h2, _, _ = _upsert_helpers(moved, store=store)
+    m2 = load(h2)
+    try:
+        m2.zoho_apply_upsert(_U_ARGS, {})
+        assert False, "should have refused"
+    except RuntimeError as e:
+        assert "Refusing to upsert" in str(e), e
+    outcomes = [x["outcome"] for x in store["/tmp/rc-test/zoho_ledger.json"]["entries"]]
+    assert outcomes == ["refused"], outcomes
+
+
+def t_apply_upsert_commits_and_records():
+    existing = [{"id": "1", "Email": "a@x.com", "Modified_Time": "t1"}]
+    h, calls, store = _upsert_helpers(existing)
+    m = load(h)
+    m.zoho_plan_upsert(_U_ARGS, {})
+    out, err = m.zoho_apply_upsert(_U_ARGS, {})
+    assert err is None
+    assert out["succeeded"] == 2 and out["failed"] == 0, out
+    assert out["planned_updates"] == 1 and out["planned_creates"] == 1, out
+    upserts = [u for meth, u in calls if u.endswith("/upsert")]
+    assert len(upserts) == 1, upserts
+    entry = store["/tmp/rc-test/zoho_ledger.json"]["entries"][0]
+    assert entry["outcome"] == "applied" and entry["command"] == "apply_upsert"
+
+
+def t_apply_upsert_batches_at_100():
+    recs = [{"Email": "u%d@x.com" % i} for i in range(250)]
+    args = {"module": "Leads", "records": recs,
+            "duplicate_check_fields": ["Email"]}
+    h, calls, _ = _upsert_helpers([])
+    m = load(h)
+    m.zoho_plan_upsert(args, {})
+    out, _ = m.zoho_apply_upsert(args, {})
+    upserts = [u for meth, u in calls if u.endswith("/upsert")]
+    assert len(upserts) == 3, upserts
+    assert out["succeeded"] == 250, out["succeeded"]
+
+
+def t_apply_upsert_counts_partial_failure_from_the_body():
+    """Zoho answers HTTP 200 when some rows fail. The status code is not the
+    answer; the body is."""
+    rows = [{"code": "SUCCESS", "details": {"id": "900"}},
+            {"code": "DUPLICATE_DATA", "message": "duplicate"}]
+    h, _, _ = _upsert_helpers([], upsert_result=rows)
+    m = load(h)
+    m.zoho_plan_upsert(_U_ARGS, {})
+    out, _ = m.zoho_apply_upsert(_U_ARGS, {})
+    assert out["succeeded"] == 1 and out["failed"] == 1, out
+    assert out["ok"] is False, out
+    assert out["errors"][0]["code"] == "DUPLICATE_DATA", out["errors"]
+
+
+
+# ------------------------------------------------------- hygiene + readiness
+def _scan_helpers(coql_rows=None, users=None, fields=None, record=None,
+                  raise_on_query=None, saved=None):
+    """COQL returns rows per query substring; GET serves users/fields/record."""
+    calls = []
+    coql_rows = coql_rows or {}
+
+    def _get(url, **k):
+        calls.append(("GET", url))
+        if "settings/fields" in url:
+            return 200, json.dumps({"fields": fields or []}).encode()
+        if url.rstrip("/").endswith("users") or "users?" in url:
+            return 200, json.dumps({"users": users or []}).encode()
+        return 200, json.dumps({"data": [record] if record else []}).encode()
+
+    def _post(url, obj, **k):
+        calls.append(("POST", url))
+        q = (obj or {}).get("select_query", "")
+        if raise_on_query and raise_on_query in q:
+            raise FakeHTTPError(400, '{"code":"INVALID_QUERY"}')
+        for frag, rows in coql_rows.items():
+            if frag in q:
+                return 200, json.dumps({"data": rows}).encode()
+        return 200, json.dumps({"data": []}).encode()
+
+    return {"oauth_refresh": lambda p, **k: {"access_token": "t",
+                                             "instance_url": "https://x"},
+            "http_get_json": _get,
+            "http_post_json": _post,
+            "http_patch_json": lambda u, d, **k: (200, b"{}"),
+            "http_delete_json": lambda u, **k: (200, b"{}"),
+            "WS": "/tmp/rc-test",
+            "jload": lambda p2, default=None: default if default is not None else {},
+            "jsave": (lambda p2, o: saved.__setitem__(p2, o))
+                     if saved is not None else (lambda p2, o: None)}, calls
+
+
+def t_hygiene_scan_reports_only_what_it_finds():
+    """A check with no rows is not a finding; silence is the healthy case."""
+    h, _ = _scan_helpers(coql_rows={
+        "Email is null": [{"id": "1", "Last_Name": "A"}]})
+    m = load(h)
+    out, err = m.zoho_hygiene_scan({}, {})
+    assert err is None
+    keys = {f["check"] for f in out["findings"]}
+    assert "leads_no_email" in keys, keys
+    assert "stale_leads" not in keys, keys
+    assert out["issues_found"] == len(out["findings"])
+
+
+def t_hygiene_scan_names_the_command_that_fixes_it():
+    """Counts and fix_with stay inline; the query lives in the report file,
+    because redact_output eats the date literal out of a COQL string."""
+    saved = {}
+    h, _ = _scan_helpers(coql_rows={
+        "Email is null": [{"id": "1"}, {"id": "2"}]}, saved=saved)
+    m = load(h)
+    out, _ = m.zoho_hygiene_scan({}, {})
+    f = [x for x in out["findings"] if x["check"] == "leads_no_email"][0]
+    assert f["fix_with"] == "zoho.plan_update", f
+    assert f["count"] == 2, f
+    assert "query" not in f, "the query must not travel through the receipt"
+    assert out["report_path"].endswith(".json"), out["report_path"]
+
+    report = saved[out["report_path"]]
+    rf = [x for x in report["findings"] if x["check"] == "leads_no_email"][0]
+    assert "select" in rf["query"].lower(), rf["query"]
+    assert rf["sample"], rf
+
+
+def t_hygiene_scan_finds_records_owned_by_deactivated_users():
+    users = [{"id": "9", "full_name": "Departed D", "status": "inactive"},
+             {"id": "1", "full_name": "Active A", "status": "active"}]
+    h, _ = _scan_helpers(users=users,
+                         coql_rows={"Owner in ('9')": [{"id": "5"}]})
+    m = load(h)
+    out, _ = m.zoho_hygiene_scan({}, {})
+    orphaned = [f for f in out["findings"] if f["check"].startswith("orphaned_")]
+    assert orphaned, out["findings"]
+    assert orphaned[0]["fix_with"] == "zoho.plan_handover", orphaned[0]
+    assert "Departed D" in out["deactivated_users"], out["deactivated_users"]
+    assert "Active A" not in out["deactivated_users"]
+
+
+def t_hygiene_scan_reports_a_broken_check_rather_than_zero():
+    """Under-reporting silently is worse than admitting a gap."""
+    h, _ = _scan_helpers(raise_on_query="Closing_Date")
+    m = load(h)
+    out, _ = m.zoho_hygiene_scan({}, {})
+    keys = {u["check"] for u in out["unavailable"]}
+    assert "overdue_deals" in keys, out["unavailable"]
+    assert "not counted as zero" in out["summary"], out["summary"]
+
+
+def t_hygiene_scan_honours_include_and_sample():
+    rows = [{"id": str(i)} for i in range(20)]
+    saved = {}
+    h, _ = _scan_helpers(coql_rows={"Email is null": rows}, saved=saved)
+    m = load(h)
+    out, _ = m.zoho_hygiene_scan({"include": ["leads_no_email"], "sample": 3}, {})
+    assert {f["check"] for f in out["findings"]} == {"leads_no_email"}
+    assert out["findings"][0]["count"] == 20
+    report = saved[out["report_path"]]
+    assert len(report["findings"][0]["sample"]) == 3, report["findings"][0]
+
+
+def t_hygiene_scan_rejects_a_nonsense_window():
+    h, _ = _scan_helpers()
+    m = load(h)
+    try:
+        m.zoho_hygiene_scan({"stale_days": 0}, {})
+        assert False
+    except RuntimeError as e:
+        assert "at least 1" in str(e), e
+
+
+def t_check_readiness_flags_missing_required_fields():
+    fields = [{"api_name": "Last_Name", "system_mandatory": True},
+              {"api_name": "Company", "system_mandatory": True},
+              {"api_name": "Notes_Field", "system_mandatory": False}]
+    record = {"id": "7", "Last_Name": "Ada", "Company": None}
+    h, _ = _scan_helpers(fields=fields, record=record)
+    m = load(h)
+    out, err = m.zoho_check_readiness({"module": "Leads", "record_id": "7"}, {})
+    assert err is None
+    assert out["ready"] is False, out
+    assert out["missing_required"] == ["Company"], out["missing_required"]
+    assert "not ready" in out["summary"].lower(), out["summary"]
+
+
+def t_check_readiness_passes_a_complete_record():
+    fields = [{"api_name": "Last_Name", "system_mandatory": True}]
+    record = {"id": "7", "Last_Name": "Ada"}
+    h, _ = _scan_helpers(fields=fields, record=record)
+    m = load(h)
+    out, _ = m.zoho_check_readiness({"module": "Leads", "record_id": "7"}, {})
+    assert out["ready"] is True, out
+    assert out["missing_required"] == [], out
+
+
+def t_check_readiness_checks_extra_named_fields():
+    fields = [{"api_name": "Last_Name", "system_mandatory": True}]
+    record = {"id": "7", "Last_Name": "Ada", "Phone": ""}
+    h, _ = _scan_helpers(fields=fields, record=record)
+    m = load(h)
+    out, _ = m.zoho_check_readiness(
+        {"module": "Leads", "record_id": "7", "require": ["Phone", "Nope"]}, {})
+    assert out["ready"] is False, out
+    notes = {x["field"]: x["note"] for x in out["missing_requested"]}
+    assert notes["Phone"] == "empty", notes
+    assert "not a field" in notes["Nope"], notes
+
+
+def t_check_readiness_ignores_read_only_required_fields():
+    """A read-only field cannot be filled in, so demanding it is noise."""
+    fields = [{"api_name": "Created_Time", "system_mandatory": True,
+               "read_only": True},
+              {"api_name": "Last_Name", "system_mandatory": True}]
+    record = {"id": "7", "Last_Name": "Ada"}
+    h, _ = _scan_helpers(fields=fields, record=record)
+    m = load(h)
+    out, _ = m.zoho_check_readiness({"module": "Leads", "record_id": "7"}, {})
+    assert out["ready"] is True, out
+
+
+def t_check_readiness_raises_on_a_missing_record():
+    h, _ = _scan_helpers(fields=[], record=None)
+    m = load(h)
+    try:
+        m.zoho_check_readiness({"module": "Leads", "record_id": "404"}, {})
+        assert False
+    except RuntimeError as e:
+        assert "not found" in str(e), e
 
 
 for name, fn in sorted((k, v) for k, v in list(globals().items())

@@ -1,18 +1,20 @@
 # shweta/zoho-crm
 
-Twenty-two commands for Zoho CRM. Reads run straight through. Writes stop at the airlock, and anything changing a set of records checks that set again before committing.
+Twenty-eight commands for Zoho CRM. Reads run straight through. Writes stop at the airlock, and anything changing a set re-checks it before committing.
 
 ## Why
 
-An approval binds to the inputs a person saw, not to the records they point at. Approve a change across 80 leads, someone edits nine while it sits there, and the write lands on state nobody reviewed. Zoho has no undo.
+An approval binds to the inputs a person saw, not the records they point at. Approve a change across 80 leads, someone edits nine while it sits there, and the write lands on state nobody reviewed.
 
-`plan_update`, `plan_delete` and `plan_handover` snapshot state and hash it first. The matching `apply_` re-reads, re-hashes, and refuses if anything moved. Scans page to completion, so a set is never half-reported.
+`plan_update`, `plan_delete`, `plan_handover` and `plan_merge` snapshot state and hash it first. The matching `apply_` re-reads, re-hashes, and refuses if anything moved. Scans page to completion, so a set is never half-reported.
 
-The fingerprint covers `Modified_Time` too, so an edit to *any* column on a matched record refuses the write, not just to the field being changed.
+The fingerprint covers `Modified_Time`, so an edit to *any* column refuses the write.
 
-And since Zoho has no undo, the module keeps its own. Every applied change goes into a local hash-chained ledger holding the prior values, so `plan_rollback` restores them and `audit_pack` shows every change and every refusal. The refusals are the useful half: they are the evidence the control fired.
+Zoho has no undo, so the module keeps its own: every applied change goes into a hash-chained ledger holding the prior values, so `plan_rollback` restores them and `audit_pack` shows every change and refusal.
 
-For teams too small for a compliance function but regulated enough that someone will eventually ask who changed a client record.
+Merging is the sharpest case: routine, irreversible, and Zoho's bin entry for a merged record has no name and no deleted-by. `plan_merge` shows every field the master will overwrite; `apply_merge` archives the loser's full record to the ledger first, because afterwards that is the only readable copy.
+
+For teams too small for a compliance function but regulated enough someone will eventually ask who changed a record.
 
 ## Install
 
@@ -22,43 +24,43 @@ railcall market install shweta/zoho-crm
 
 ## Credentials
 
-Self Client at api-console.zoho.com. Scopes:
+Self Client at api-console.zoho.com, scopes:
 
 ```
 ZohoCRM.modules.ALL,ZohoCRM.settings.fields.READ,ZohoCRM.users.READ,ZohoCRM.coql.READ
 ```
 
-`ZohoCRM.org.READ` is optional.
+Exchange the grant code for a refresh token, then save a vault entry named `zoho` with `refresh_token`, `client_id`, `client_secret`, `token_url`, `instance_url`.
 
-Exchange the grant code for a refresh token, then save a vault entry named `zoho` holding `refresh_token`, `client_id`, `client_secret`, `token_url` and `instance_url`.
+Swap `.in` for your region: a token minted in one datacenter will not work in another.
 
-Swap `.in` for your region: a token minted in one datacenter will not authenticate against another.
-
-Run `zoho.verify_connection` first. It probes every scope and names any missing one plus the commands it blocks, so a bad setup surfaces at once.
+Run `zoho.verify_connection` first: it names any missing scope and what it blocks.
 
 ## Example
 
-Run `zoho.plan_update` on Leads with a query and a `changes` object. Someone edits one of those leads. Then `zoho.apply_update`, same three inputs:
+Run `zoho.plan_update` with a module, query and `changes`. Someone edits one of those leads. Then `zoho.apply_update`, same three inputs:
 
 ```
-Refusing to apply. The records moved since the plan was made: 3 now match
-the query and the state fingerprint is sha256:e591e62d..., not sha256:a3f1c088...
+Refusing to apply. The records moved since the plan was made:
+the state fingerprint is sha256:e591e62d..., not sha256:a3f1c088...
 ```
 
 ## Commands
 
-Read: `verify_connection` `describe_module` `search_records` `list_records` `get_record` `list_users` `plan_update` `plan_delete` `plan_handover` `plan_rollback` `verify_ledger` `audit_pack`
+Read: `verify_connection` `describe_module` `search_records` `list_records` `get_record` `list_users` `plan_update` `plan_delete` `plan_handover` `plan_rollback` `plan_merge` `plan_upsert` `hygiene_scan` `check_readiness` `verify_ledger` `audit_pack`
 
-Write, approval required: `apply_update` `apply_delete` `apply_handover` `apply_rollback` `create_record` `update_record` `upsert_records` `delete_record` `convert_lead` `add_note`
+Write, approval required: `apply_update` `apply_delete` `apply_handover` `apply_rollback` `apply_merge` `apply_upsert` `create_record` `update_record` `upsert_records` `delete_record` `convert_lead` `add_note`
 
-`delete_record` and `convert_lead` act on ids you pass directly; `plan_delete` is the query-driven form. `plan_rollback` undoes a previous `apply_update`, and refuses on drift like any other write.
+`delete_record` and `convert_lead` act on ids you pass directly; `plan_delete` is the query-driven form.
 
-Every command, with examples, errors and COQL gotchas: [COMMANDS.md](COMMANDS.md)
+`hygiene_scan` answers a question rather than wrapping an endpoint: stale records, overdue deals, records owned by someone who left. Counts come back inline; the query behind each finding goes to a file, because receipts redact identifiers and dates.
+
+Every command, with examples and errors: [COMMANDS.md](COMMANDS.md)
 
 ## Limits
 
-100 records per write call, 2000 per scan before it refuses rather than half-reports. Deletes go to the recycle bin for 60 days; rollback covers updates only. Bulk and Notification APIs, Activities, attachments and tags are not covered. The manifest declares `subprocess: false` and an empty `allowed_destinations`, which is a signed declaration that this module makes no LLM calls at all. Subprocess enforcement is at the Python import layer, not a container.
+100 records per write call, 2000 per scan. `plan_upsert` pages larger sets; its drift check covers existing records only. Deletes go to the recycle bin for 60 days; rollback covers updates only. Bulk and Notification APIs, Activities and tags are not wrapped. The manifest declares `subprocess: false` and an empty `allowed_destinations`: a signed declaration that this module makes no LLM calls.
 
-Any write can be capped per day in the station's `rate_limits.json`; a blocked attempt does not consume its approval.
+Any write can be capped per day in `rate_limits.json`; a block does not consume its approval.
 
-Tested against Zoho CRM v8. All twenty-two commands run against a live org.
+Tested against Zoho CRM v8. All twenty-eight commands run against a live org.

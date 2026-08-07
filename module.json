@@ -1,11 +1,12 @@
 {
   "id": "shweta/zoho-crm",
   "name": "zoho-crm",
-  "version": "0.6.2",
+  "version": "0.7.0",
   "provider": "zoho",
+  "category": "Revenue",
   "homepage": "https://github.com/shwetadinkar/zoho-crm-railcall",
   "tests_url": "https://github.com/shwetadinkar/zoho-crm-railcall/blob/main/test_handler.py",
-  "description": "Governed Zoho CRM for small teams and AI agents. Twenty-two commands across Leads, Contacts, Accounts, Deals and any custom module. Every write is held behind the airlock and sealed into a signed receipt.\n\nWHO IT'S FOR: teams too small for a compliance function but regulated enough that 'who changed this client record, and who approved it' gets asked eventually. Also anyone giving an AI agent write access to a CRM.\n\nTHE PROBLEM: CRM has no undo. A wrong filter on a mass update rewrites 400 client records and there is no rollback, only a restore request. Zoho Flow and Zapier will both run that automation; neither can stop it, and neither records who authorised it.\n\nTWELVE READS (no approval): verify_connection probes every scope and names any missing one plus the commands it blocks. describe_module returns every field including custom ones. search_records runs read-only COQL. list_records pages a module, get_record fetches one by id, list_users returns users and their ids. plan_update, plan_delete and plan_handover work out what a change would do without doing it. plan_rollback reports what undoing an applied change would restore. verify_ledger and audit_pack expose the local record of every change and every refusal.\n\nTEN WRITES (preview then approve): apply_update, apply_delete, apply_handover and apply_rollback commit the matching plan, each refusing if the records moved since review. create_record and update_record work on any module, 100 per call. upsert_records inserts or updates against duplicate-check fields. delete_record moves to the recycle bin. convert_lead turns a Lead into a Contact and Account. add_note writes reasoning back onto a record.\n\nPLAN THEN APPLY: an approval binds to the inputs a human saw, not to the records they point at. Approve a diff over 80 records, someone edits nine while it sits there, and the write lands on state nobody reviewed. Each plan snapshots the state it will change and fingerprints it; the matching apply re-reads, re-hashes, and refuses if anything moved. Scans page to completion, so a set is never half-reported. Applied changes are recorded in a hash-chained local ledger, so plan_rollback can restore prior values and audit_pack can show every refusal.\n\nRELIABILITY: Zoho reports partial failure with HTTP 200, so a batch where 3 of 50 fail still looks successful. Every write returns succeeded, failed and per-record errors. Writes are never auto-retried after a server error, since Zoho has no idempotency key. Setup and scopes: see README. contest:2026Q3",
+  "description": "Governed Zoho CRM for small teams and AI agents. Twenty-eight commands across Leads, Contacts, Accounts, Deals and any custom module. Every write is held behind the airlock and sealed into a signed receipt.\n\nWHO IT'S FOR: teams too small for a compliance function but regulated enough that 'who changed this client record, and who approved it' gets asked eventually.\n\nTHE PROBLEM: CRM has no undo. A wrong filter on a mass update rewrites 400 client records and there is no rollback, only a restore request. Zoho Flow and Zapier will both run that automation; neither can stop it, and neither records who authorised it.\n\nSIXTEEN READS (no approval): verify_connection probes every scope and names any missing one plus what it blocks. describe_module returns every field including custom ones. search_records runs read-only COQL. list_records pages a module, get_record fetches one by id, list_users returns users and their ids. plan_update, plan_delete and plan_handover work out what a change would do without doing it. plan_rollback reports what undoing an applied change would restore. verify_ledger and audit_pack expose the local record of every change and every refusal. plan_merge shows exactly what a merge would destroy: every field the master will overwrite, and everything attached that would move. plan_upsert reports the exact create/update split of a bulk upsert before anything is written. hygiene_scan finds what is quietly rotting - stale leads and deals, deals past their closing date still open, records with no email, records still owned by a deactivated user - and names the governed command that fixes each one. check_readiness tests one record against the fields the module requires plus any you name.\n\nTWELVE WRITES (preview then approve): apply_update, apply_delete, apply_handover, apply_rollback, apply_merge and apply_upsert commit the matching plan, each refusing if the records moved since review. create_record and update_record work on any module, 100 per call. upsert_records inserts or updates against duplicate-check fields, 100 per call; plan_upsert and apply_upsert are the governed form for larger sets, paging the lookup and reporting the create/update split first. Drift there covers records that already exist - a record about to be created has no prior state to move. delete_record moves to the recycle bin. convert_lead turns a Lead into a Contact and Account. add_note writes reasoning back onto a record.\n\nPLAN THEN APPLY: an approval binds to the inputs a human saw, not to the records they point at. Approve a diff over 80 records, someone edits nine while it sits there, and the write lands on state nobody reviewed. Each plan snapshots the state it will change and fingerprints it; the matching apply re-reads, re-hashes, and refuses if anything moved. Scans page to completion, so a set is never half-reported. Applied changes are recorded in a hash-chained local ledger, so plan_rollback can restore prior values and audit_pack can show every refusal.\n\nRELIABILITY: Zoho reports partial failure with HTTP 200, so a batch where 3 of 50 fail still looks successful. Every write returns succeeded, failed and per-record errors. Writes are never auto-retried: Zoho has no idempotency key. DEDUPE: merging is routine housekeeping and the most irreversible thing in the API. Zoho's bin entry for a merged record has no name and no deleted-by, and its restore endpoint answers 200 while doing nothing. apply_merge writes the loser's full record to the ledger before the merge fires - afterwards that is the only readable copy. No rollback. Setup and scopes: see README. contest:2026Q3",
   "credential_spec": {
     "provider": "zoho",
     "category": "crm",
@@ -784,6 +785,239 @@
         "ledger_seq": "number"
       },
       "description": "Commits a plan made by zoho.plan_rollback. A rollback is a write like any other: it re-reads, re-hashes and refuses if the records moved since the plan."
+    },
+    {
+      "id": "zoho.plan_merge",
+      "title": "Show exactly what a merge would destroy, before merging",
+      "provider": "zoho",
+      "risk": "low",
+      "mode": "read",
+      "requires": [
+        "ZOHO_OAUTH"
+      ],
+      "preview": false,
+      "receipt_required": true,
+      "input_schema": {
+        "module": {
+          "type": "string",
+          "required": true,
+          "description": "Leads or Contacts. Merge is verified on these two only."
+        },
+        "master_id": {
+          "type": "string",
+          "required": true,
+          "description": "The record that survives; its values win."
+        },
+        "loser_ids": {
+          "type": "array",
+          "required": true,
+          "description": "Records to merge in, max 3. They cease to exist."
+        }
+      },
+      "output_schema": {
+        "master_id": "string",
+        "losers": "array",
+        "count": "number",
+        "conflicting_fields": "number",
+        "related_records_moving": "number",
+        "irreversible": "string",
+        "summary": "string"
+      },
+      "description": "Reports every field where the loser holds a value the master will overwrite, everything attached that would move, and who last touched each record. Changes nothing. Merge cannot be undone, so this is the only chance to notice the wrong record was chosen as master."
+    },
+    {
+      "id": "zoho.apply_merge",
+      "title": "Commit a merge, refusing if anything moved since the plan",
+      "provider": "zoho",
+      "risk": "high",
+      "mode": "write_requires_approval",
+      "requires": [
+        "ZOHO_OAUTH"
+      ],
+      "preview": true,
+      "receipt_required": true,
+      "input_schema": {
+        "module": {
+          "type": "string",
+          "required": true,
+          "description": "Leads or Contacts, matching the plan."
+        },
+        "master_id": {
+          "type": "string",
+          "required": true,
+          "description": "The same master_id used for the plan."
+        },
+        "loser_ids": {
+          "type": "array",
+          "required": true,
+          "description": "The same loser_ids used for the plan."
+        }
+      },
+      "output_schema": {
+        "master_id": "string",
+        "succeeded": "number",
+        "failed": "number",
+        "merged": "array",
+        "recoverable": "string",
+        "ledger_seq": "number",
+        "summary": "string"
+      },
+      "description": "Commits a plan from zoho.plan_merge. Re-reads, re-hashes and refuses on drift. The losing records' full values are written to the ledger before the merge fires, because Zoho's recycle-bin entry for a merged record has no name and no deleted-by, and its restore endpoint answers 200 while doing nothing. There is no rollback."
+    },
+    {
+      "id": "zoho.plan_upsert",
+      "title": "Plan a bulk upsert across a large set, before writing any of it",
+      "provider": "zoho",
+      "risk": "low",
+      "mode": "read",
+      "requires": [
+        "ZOHO_OAUTH"
+      ],
+      "preview": false,
+      "receipt_required": true,
+      "input_schema": {
+        "module": {
+          "type": "string",
+          "required": true,
+          "description": "Module API name."
+        },
+        "records": {
+          "type": "array",
+          "required": true,
+          "description": "Objects to insert or update, up to 2000."
+        },
+        "duplicate_check_fields": {
+          "type": "array",
+          "required": true,
+          "description": "Fields Zoho matches on to decide insert vs update."
+        }
+      },
+      "output_schema": {
+        "total": "number",
+        "will_update": "number",
+        "will_create": "number",
+        "updates": "array",
+        "creates": "array",
+        "calls_required": "number",
+        "drift_covers": "string",
+        "summary": "string"
+      },
+      "description": "Pages the lookup to completion and reports the exact create/update split before anything is written. Drift detection covers the records that already exist; a record about to be created has no prior state to move, and the output says so."
+    },
+    {
+      "id": "zoho.apply_upsert",
+      "title": "Commit a bulk upsert, refusing if an existing record moved",
+      "provider": "zoho",
+      "risk": "high",
+      "mode": "write_requires_approval",
+      "requires": [
+        "ZOHO_OAUTH"
+      ],
+      "preview": true,
+      "receipt_required": true,
+      "input_schema": {
+        "module": {
+          "type": "string",
+          "required": true,
+          "description": "Module API name, matching the plan."
+        },
+        "records": {
+          "type": "array",
+          "required": true,
+          "description": "The same records used for the plan."
+        },
+        "duplicate_check_fields": {
+          "type": "array",
+          "required": true,
+          "description": "The same fields used for the plan."
+        }
+      },
+      "output_schema": {
+        "succeeded": "number",
+        "failed": "number",
+        "errors": "array",
+        "planned_updates": "number",
+        "planned_creates": "number",
+        "ledger_seq": "number",
+        "summary": "string"
+      },
+      "description": "Commits a plan from zoho.plan_upsert, batched at Zoho's 100 per call. Zoho answers HTTP 200 even when rows fail, so succeeded and failed are counted from the response body."
+    },
+    {
+      "id": "zoho.hygiene_scan",
+      "title": "Find what is quietly rotting: stale records, orphaned owners, overdue deals",
+      "provider": "zoho",
+      "risk": "low",
+      "mode": "read",
+      "requires": [
+        "ZOHO_OAUTH"
+      ],
+      "preview": false,
+      "receipt_required": true,
+      "input_schema": {
+        "stale_days": {
+          "type": "number",
+          "required": false,
+          "description": "How many days without a change counts as stale. Default 90."
+        },
+        "include": {
+          "type": "array",
+          "required": false,
+          "description": "Restrict to named checks. Omit to run all."
+        },
+        "sample": {
+          "type": "number",
+          "required": false,
+          "description": "Example records per finding, max 25. Default 5."
+        }
+      },
+      "output_schema": {
+        "findings": "array",
+        "report_path": "string",
+        "issues_found": "number",
+        "records_affected": "number",
+        "unavailable": "array",
+        "deactivated_users": "array",
+        "summary": "string"
+      },
+      "description": "Scans for leads and deals nobody has touched, deals past their closing date still open, records with no email, and records still owned by a deactivated user. Counts and reasoning come back inline; the COQL behind each finding and the matching record ids are written to a file, because receipts redact identifiers and dates. A check the org rejects is reported as unavailable rather than counted as zero. Changes nothing."
+    },
+    {
+      "id": "zoho.check_readiness",
+      "title": "Check one record has the fields it needs before you act on it",
+      "provider": "zoho",
+      "risk": "low",
+      "mode": "read",
+      "requires": [
+        "ZOHO_OAUTH"
+      ],
+      "preview": false,
+      "receipt_required": true,
+      "input_schema": {
+        "module": {
+          "type": "string",
+          "required": true,
+          "description": "Module API name."
+        },
+        "record_id": {
+          "type": "string",
+          "required": true,
+          "description": "The record to check."
+        },
+        "require": {
+          "type": "array",
+          "required": false,
+          "description": "Extra field api_names that must be filled."
+        }
+      },
+      "output_schema": {
+        "ready": "string",
+        "missing_required": "array",
+        "missing_requested": "array",
+        "required_fields_checked": "number",
+        "summary": "string"
+      },
+      "description": "Reads the module's required fields from describe and checks the record against them, plus any extra fields you name. Zoho enforces required fields on its own forms, not on an API write, so a record can be saved incomplete and sit in a forecast being wrong."
     }
   ],
   "manifest_version": 2,

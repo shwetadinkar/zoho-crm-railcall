@@ -1,4 +1,4 @@
-"""shweta/zoho-crm 0.6.2
+"""shweta/zoho-crm 0.7.0
 
 Vault entry `zoho`:
 
@@ -963,6 +963,932 @@ def _handover_fingerprint(found):
     blob = _json.dumps({m: sorted(ids) for m, ids in found.items()},
                        sort_keys=True, separators=(",", ":"))
     return "sha256:" + hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+
+# =============================================================================
+# DEDUPE  -  paste into handler.py after zoho_apply_rollback, before the
+# handover section.
+#
+# Merge is the most destructive operation reachable on this module's scopes and
+# the least visible afterwards. Verified live against the org on 2026-08-01 and
+# 2026-08-03:
+#
+#   POST /crm/v8/{module}/{master_id}/actions/merge
+#   {"merge": [{"data": [{"id": "<loser_id>"}]}]}
+#
+#   - synchronous, 201 SUCCESS, no extra OAuth scope
+#   - notes are REPARENTED to the master, not destroyed
+#   - the master's field values win; the loser's are lost silently
+#   - the loser is gone: direct fetch returns 204, invisible to COQL
+#   - the recycle-bin entry has display_name=None and deleted_by=None, so an
+#     operator opening the bin sees an unidentifiable blank row
+#   - PUT /actions/restore answers HTTP 200 with an empty body and does nothing
+#
+# So there is no undo, no usable bin entry, and no attribution. And merging is
+# routine - housekeeping, done casually, by whoever notices the duplicate.
+# =============================================================================
+
+# Verified on Leads and Contacts. Accounts and Deals are untested, and assuming
+# they behave the same is the assumption this project keeps disproving.
+_MERGE_MODULES = ("Leads", "Contacts")
+
+# Zoho accepts a list under data[]; this cap is ours, not theirs. Three losers
+# is already a large enough diff for a person to actually read before they
+# approve something irreversible.
+_MERGE_MAX_LOSERS = 3
+
+# Read for the preview and the fingerprint, never written.
+_MERGE_CONTEXT_FIELDS = ["Modified_Time", "Modified_By", "Created_By"]
+
+# Related lists, and how to reach them. The nested REST routes
+# (GET Leads/{id}/Tasks) answer 400 REQUIRED_PARAM_MISSING; COQL works. Both
+# verified 2026-08-03.
+_MERGE_RELATED = (
+    ("Notes", "Parent_Id", "Note_Title"),
+    ("Tasks", "What_Id", "Subject"),
+    ("Calls", "What_Id", "Subject"),
+    ("Events", "What_Id", "Event_Title"),
+    ("Attachments", "Parent_Id", "File_Name"),
+)
+
+
+def _merge_module(inputs):
+    """Resolve and canonicalise the module, or refuse.
+
+    Matched case-insensitively and returned in Zoho's casing. Elsewhere in this
+    module a wrong case fails at the API with Zoho's own error, which is fine
+    for a read. Here the operation cannot be undone, so a confusing rejection
+    is worth avoiding.
+    """
+    module = _module_name(inputs)
+    for known in _MERGE_MODULES:
+        if module.lower() == known.lower():
+            return known
+    raise RuntimeError(
+        "Merge is verified on %s only. %r is not covered: Zoho may behave "
+        "differently there and this command will not guess about an operation "
+        "that cannot be undone."
+        % (" and ".join(_MERGE_MODULES), module))
+
+
+def _merge_ids(inputs):
+    master = str(inputs.get("master_id", "")).strip()
+    if not master:
+        raise RuntimeError("'master_id' is required: the record that survives "
+                           "the merge and whose values win.")
+    losers = inputs.get("loser_ids")
+    if isinstance(losers, str):
+        losers = [losers]
+    if not isinstance(losers, list) or not losers:
+        raise RuntimeError("'loser_ids' is required: an array of record ids to "
+                           "merge into the master. They will cease to exist.")
+    losers = [str(x).strip() for x in losers if str(x).strip()]
+    if not losers:
+        raise RuntimeError("'loser_ids' contained no usable ids.")
+    if master in losers:
+        raise RuntimeError("The master id appears in loser_ids. A record "
+                           "cannot be merged into itself.")
+    if len(set(losers)) != len(losers):
+        raise RuntimeError("'loser_ids' contains duplicates.")
+    if len(losers) > _MERGE_MAX_LOSERS:
+        raise RuntimeError(
+            "%d losers requested; this command allows %d per call. A merge "
+            "cannot be undone, and a diff nobody reads is not a review."
+            % (len(losers), _MERGE_MAX_LOSERS))
+    return master, losers
+
+
+def _merge_key(module, master, losers):
+    return _plan_key("merge:" + module, master, {"losers": sorted(losers)})
+
+
+def _merge_read_full(module, rec_id):
+    """Every field on one record. describe_module gives the field list; the
+    merge preview needs all of them, because any field the loser holds and the
+    master does not is a value about to disappear."""
+    response = _call("GET", "%s/%s" % (module, rec_id))
+    rows = response.get("data") or []
+    return rows[0] if rows else None
+
+
+def _merge_related_counts(rec_id):
+    """What is attached to a record, per related list.
+
+    COQL rather than the nested REST route: GET Leads/{id}/Notes and friends
+    answer 400 REQUIRED_PARAM_MISSING on v8. Verified 2026-08-03.
+    """
+    out = {}
+    for mod, link, label_field in _MERGE_RELATED:
+        try:
+            rows = _coql_all(
+                "select id, %s from %s where %s = '%s'"
+                % (label_field, mod, link, rec_id),
+                cap=_SCAN_CAP, label="%s on %s" % (mod, rec_id))
+        except Exception:
+            # A related list this org does not expose is not a reason to
+            # refuse the whole preview - but it must not be silently counted
+            # as zero either.
+            out[mod] = {"count": None, "titles": [],
+                        "note": "could not be read; treat as unknown"}
+            continue
+        out[mod] = {
+            "count": len(rows),
+            "titles": [str(r.get(label_field) or "") for r in rows[:5]],
+        }
+    return out
+
+
+# Fields that always differ between any two records and are never something an
+# operator can act on. Zoho stamps these itself; showing them buries the three
+# or four conflicts that actually matter under a wall of timestamps. Verified
+# against a live merge preview on 2026-08-07, where 4 of 7 "conflicts" were
+# system time fields.
+_MERGE_IGNORED_FIELDS = frozenset({
+    "id", "Created_Time", "Modified_Time", "Created_By", "Modified_By",
+    "Last_Activity_Time", "Change_Log_Time__s", "Record_Image",
+    "Locked__s", "Tag", "$approved", "$approval", "$editable",
+    "$process_flow", "$review", "$review_process", "$orchestration",
+    "$in_merge", "$approval_state", "$sharing_permission", "$state",
+    "$converted", "$converted_detail", "$zia_visions", "$field_states",
+    "$has_more", "$pathfinder", "$wizard_connection_path",
+    "$is_duplicate", "$following", "$photo_id", "$layout_id__s",
+})
+
+
+def _merge_ignorable(field):
+    """True for system fields nobody can act on.
+
+    The explicit set above plus two shapes: anything starting with `$`, which
+    is Zoho's internal namespace, and anything ending `_Time` or `_Time__s`,
+    which is a stamp rather than a value.
+    """
+    if field in _MERGE_IGNORED_FIELDS:
+        return True
+    if field.startswith("$"):
+        return True
+    if field.endswith("_Time") or field.endswith("_Time__s"):
+        return True
+    return False
+
+
+def _merge_conflicts(master_rec, loser_rec):
+    """Fields where the loser holds a value the master will overwrite.
+
+    This is the whole point of the preview. The master wins silently, so an
+    operator has to see the phone number that is about to vanish while they can
+    still swap which record is the master - which only works if the list is
+    short enough to read. System stamps are filtered out and counted
+    separately rather than dropped silently.
+    """
+    conflicts, only_on_loser, system = [], [], []
+    for field, lval in sorted((loser_rec or {}).items()):
+        if _merge_ignorable(field):
+            mval = (master_rec or {}).get(field)
+            if lval not in (None, "", [], {}) and mval != lval:
+                system.append(field)
+            continue
+        if lval in (None, "", [], {}):
+            continue
+        mval = (master_rec or {}).get(field)
+        if mval in (None, "", [], {}):
+            only_on_loser.append({"field": field, "loser": lval})
+        elif mval != lval:
+            conflicts.append({"field": field, "master": mval, "loser": lval})
+    return conflicts, only_on_loser, system
+
+
+def zoho_plan_merge(inputs, stamp):
+    """Work out exactly what a merge would destroy, without merging anything.
+
+    Reports three things, in the order an operator needs them: what will be
+    lost, what will move, and who last touched these records.
+
+    Merge is irreversible. Zoho's recycle-bin entry for a merged record carries
+    no name and no deleted-by, and the restore endpoint answers 200 while doing
+    nothing. So this preview is the only chance to notice that the wrong record
+    was chosen as master.
+    """
+    module = _merge_module(inputs)
+    master_id, loser_ids = _merge_ids(inputs)
+
+    master = _merge_read_full(module, master_id)
+    if master is None:
+        raise RuntimeError("Master record %s not found in %s."
+                           % (master_id, module))
+
+    losers, missing = [], []
+    for rid in loser_ids:
+        rec = _merge_read_full(module, rid)
+        if rec is None:
+            missing.append(rid)
+            continue
+        conflicts, only_on_loser, system = _merge_conflicts(master, rec)
+        losers.append({
+            "id": rid,
+            "conflicts": conflicts,
+            "only_on_loser": only_on_loser,
+            "system_fields_differing": len(system),
+            "related": _merge_related_counts(rid),
+            "modified_time": rec.get("Modified_Time"),
+            "modified_by": (rec.get("Modified_By") or {}).get("name")
+                           if isinstance(rec.get("Modified_By"), dict)
+                           else rec.get("Modified_By"),
+        })
+    if missing:
+        raise RuntimeError(
+            "These records do not exist in %s: %s. A merge plan has to be "
+            "built from records that are actually there."
+            % (module, ", ".join(missing)))
+
+    # Fingerprint every record involved, master included: if the master is
+    # edited between plan and apply, the values that win are not the values
+    # that were reviewed.
+    everyone = [master_id] + loser_ids
+    current = _read_by_ids(module, everyone, _MERGE_CONTEXT_FIELDS)
+    fingerprint, _snapshot = _fingerprint(module, current, _MERGE_CONTEXT_FIELDS)
+    _plan_save(_merge_key(module, master_id, loser_ids),
+               {"fingerprint": fingerprint,
+                "master_id": master_id,
+                "loser_ids": loser_ids,
+                "count": len(loser_ids)})
+
+    total_conflicts = sum(len(l["conflicts"]) for l in losers)
+    total_related = sum(
+        (v.get("count") or 0)
+        for l in losers for v in l["related"].values())
+
+    return {
+        "ok": True,
+        "module": module,
+        "master_id": master_id,
+        "losers": losers,
+        "count": len(losers),
+        "conflicting_fields": total_conflicts,
+        "related_records_moving": total_related,
+        "master_modified_time": master.get("Modified_Time"),
+        "expires_in_minutes": _PLAN_TTL // 60,
+        "irreversible": True,
+        "summary": (
+            "Merging %d record(s) into %s. %d field value(s) held by the "
+            "losers will be overwritten by the master's and lost; %d related "
+            "record(s) will move to the master. Notes, tasks, calls, events "
+            "and attachments are reparented, not deleted. The losing records "
+            "themselves cannot be recovered: Zoho's restore endpoint answers "
+            "200 and does nothing after a merge, and the recycle-bin entry "
+            "carries no name. Read the conflicts before approving, and swap "
+            "the master if the wrong values are winning."
+            % (len(losers), master_id, total_conflicts, total_related)),
+        "origin": _origin(stamp),
+    }, None
+
+
+def zoho_apply_merge(inputs, stamp):
+    """Commit a merge plan, refusing if any record moved since it was made.
+
+    Two things differ from every other apply in this module.
+
+    The ledger entry is written BEFORE the API call, not after. Everywhere else
+    the ledger writes afterwards, because recording a change that never
+    happened is worse than missing one. Here the reasoning inverts: a merge
+    with no record of what the loser held is unrecoverable in a way an
+    unrecorded update is not, and Zoho's own bin entry is useless. If the
+    ledger write fails, the merge does not proceed.
+
+    And there is no rollback. plan_rollback covers apply_update only. The
+    ledger entry is a reference - someone can look up the phone number that
+    vanished and re-enter it by hand - not an undo.
+    """
+    module = _merge_module(inputs)
+    master_id, loser_ids = _merge_ids(inputs)
+    key = _merge_key(module, master_id, loser_ids)
+
+    stored = _plan_load(key)
+    if not stored:
+        raise RuntimeError(
+            "No current plan for this merge. Run zoho.plan_merge first, read "
+            "what it says will be lost, then apply with exactly the same "
+            "module, master_id and loser_ids. Plans expire after %d minutes."
+            % (_PLAN_TTL // 60))
+
+    everyone = [master_id] + loser_ids
+    current = _read_by_ids(module, everyone, _MERGE_CONTEXT_FIELDS)
+    actual, _snapshot = _fingerprint(module, current, _MERGE_CONTEXT_FIELDS)
+    expected = str(stored.get("fingerprint") or "")
+
+    if actual != expected:
+        _ledger_append(_ledger_note(
+            "refused", "apply_merge", module, key,
+            {"reason": "state moved between plan and apply",
+             "expected": expected, "actual": actual,
+             "master_id": master_id, "losers": len(loser_ids)}))
+        raise RuntimeError(
+            "Refusing to merge. One of these records moved since the plan was "
+            "made: the state fingerprint is %s, not %s. A merge cannot be "
+            "undone, so re-run zoho.plan_merge and read the new diff."
+            % (actual[:23] + "...", expected[:23] + "..."))
+
+    if len(current) != len(everyone):
+        found = {str(r.get("id")) for r in current}
+        gone = [r for r in everyone if r not in found]
+        raise RuntimeError(
+            "These records are no longer readable: %s. Re-run zoho.plan_merge."
+            % ", ".join(gone))
+
+    # The full record of each loser, written before anything is destroyed.
+    # After the merge this is the only readable copy that exists anywhere:
+    # Zoho's bin entry has no display_name and no deleted_by.
+    archive = []
+    for rid in loser_ids:
+        rec = _merge_read_full(module, rid)
+        archive.append({
+            "id": rid,
+            "record": rec,
+            "related": _merge_related_counts(rid),
+        })
+    entry = _ledger_append(_ledger_note(
+        "applied", "apply_merge", module, key,
+        {"master_id": master_id, "losers": loser_ids,
+         "fingerprint": expected,
+         "irreversible": True,
+         "archive": archive}))
+
+    merged, failed = [], []
+    for rid in loser_ids:
+        # One loser at a time so a partial failure is legible: with a single
+        # batched call, a failure halfway through leaves no way to say which
+        # records were merged and which were not.
+        try:
+            response = _call("POST", "%s/%s/actions/merge" % (module, master_id),
+                             body={"merge": [{"data": [{"id": rid}]}]})
+            rows = (response or {}).get("merge") or []
+            code = (rows[0] or {}).get("code") if rows else None
+            if code == "SUCCESS":
+                merged.append(rid)
+            else:
+                failed.append({"id": rid, "response": rows[0] if rows else response})
+        except Exception as e:                                  # noqa: BLE001
+            failed.append({"id": rid, "error": str(e)[:200]})
+
+    return {
+        "ok": not failed,
+        "action": "merge into %s/%s" % (module, master_id),
+        "master_id": master_id,
+        "succeeded": len(merged),
+        "failed": len(failed),
+        "merged": merged,
+        "errors": failed,
+        "fingerprint_verified": expected,
+        "ledger_seq": entry["seq"],
+        "recoverable": False,
+        "summary": (
+            "Merged %d of %d record(s) into %s. The losing records are gone "
+            "and cannot be restored; their full values are in ledger entry %d, "
+            "which is the only readable copy. Related records were reparented "
+            "to the master."
+            % (len(merged), len(loser_ids), master_id, entry["seq"])),
+        "origin": _origin(stamp),
+    }, None
+
+
+
+# =============================================================================
+# BULK UPSERT  -  paste into handler.py after zoho_apply_merge, before the
+# handover section.
+#
+# upsert_records already covers one call of up to 100. This is the governed
+# form for a set larger than that: page the whole thing, tell the operator how
+# many records will be CREATED versus UPDATED before anything happens, and
+# refuse if the ones that already exist moved between review and execution.
+#
+# HONEST LIMIT, and it is stated in the command output rather than only here:
+# drift detection covers the records that ALREADY EXIST. A record about to be
+# created has no prior state, so there is nothing to fingerprint and nothing
+# that can move. The guarantee is therefore weaker than plan_update's - the
+# preview is exact about which is which, and the drift check applies to the
+# update half only.
+# =============================================================================
+
+_UPSERT_CALL = 100        # Zoho's per-call ceiling for upsert
+_UPSERT_CAP = 2000        # refuse past this rather than half-apply
+
+
+def _upsert_records_arg(inputs):
+    records = inputs.get("records")
+    if not isinstance(records, list) or not records:
+        raise RuntimeError("'records' must be a non-empty array of objects to "
+                           "insert or update.")
+    if not all(isinstance(r, dict) for r in records):
+        raise RuntimeError("'records' must contain objects, one per record.")
+    if len(records) > _UPSERT_CAP:
+        raise RuntimeError(
+            "%d records requested; this command refuses past %d rather than "
+            "half-applying a set. Split it." % (len(records), _UPSERT_CAP))
+    return records
+
+
+def _upsert_check_fields(inputs, records):
+    fields = inputs.get("duplicate_check_fields")
+    if isinstance(fields, str):
+        fields = [fields]
+    if not isinstance(fields, list) or not fields:
+        raise RuntimeError(
+            "'duplicate_check_fields' is required: the field or fields Zoho "
+            "matches on to decide whether a record is an insert or an update. "
+            "Without it the plan cannot tell you which is which.")
+    fields = [str(f).strip() for f in fields if str(f).strip()]
+    missing = sorted({f for f in fields
+                      for r in records if f not in r})
+    if missing:
+        raise RuntimeError(
+            "Every record must carry the duplicate-check fields. Missing %s on "
+            "at least one record." % ", ".join(missing))
+    return fields
+
+
+def _upsert_key(module, records, fields):
+    """A plan is addressed by the same inputs that made it.
+
+    Receipts redact identifiers, so a plan token could not survive the round
+    trip - the same constraint plan_update works under. Keyed on the check
+    fields plus the values being matched, not the whole payload, so a plan
+    stays valid if a non-matched field is corrected before apply.
+    """
+    keys = sorted(
+        "|".join("%s=%s" % (f, r.get(f)) for f in fields) for r in records)
+    return _plan_key("upsert:" + module, ",".join(sorted(fields)),
+                     {"keys": keys})
+
+
+def _upsert_existing(module, records, fields):
+    """Find which of these records already exist, matched on the check fields.
+
+    One COQL per check field rather than per record: a set of 500 records would
+    otherwise be 500 round trips. Values are matched with `in (...)`, the same
+    form plan_delete uses.
+    """
+    found = {}
+    for field in fields:
+        values = sorted({str(r.get(field)) for r in records
+                         if r.get(field) not in (None, "")})
+        if not values:
+            continue
+        for start in range(0, len(values), _UPSERT_CALL):
+            chunk = values[start:start + _UPSERT_CALL]
+            quoted = ", ".join("'%s'" % v.replace("'", "") for v in chunk)
+            rows = _coql_all(
+                "select id, %s, Modified_Time from %s where %s in (%s)"
+                % (field, module, field, quoted),
+                cap=_UPSERT_CAP + _COQL_PAGE,
+                label="upsert lookup on " + module)
+            for row in rows:
+                found[str(row.get(field))] = row
+    return found
+
+
+def _upsert_split(records, fields, existing):
+    """Classify each record as an update or a create, and say why."""
+    updates, creates = [], []
+    for rec in records:
+        match = None
+        for field in fields:
+            hit = existing.get(str(rec.get(field)))
+            if hit:
+                match = (field, hit)
+                break
+        if match:
+            field, hit = match
+            updates.append({"id": str(hit.get("id")),
+                            "matched_on": field,
+                            "matched_value": rec.get(field),
+                            "modified_time": hit.get("Modified_Time")})
+        else:
+            creates.append({f: rec.get(f) for f in fields})
+    return updates, creates
+
+
+def zoho_plan_upsert(inputs, stamp):
+    """Work out which records a bulk upsert would create and which it would
+    update, without writing anything.
+
+    upsert_records handles one call of up to 100. This is the governed form for
+    a larger set: it pages the lookup to completion, reports the split, and
+    fingerprints the records that already exist so apply_upsert can refuse if
+    they move.
+
+    The drift guarantee is narrower than plan_update's, and the output says so:
+    a record that does not exist yet has no prior state to move.
+    """
+    module = _module_name(inputs)
+    records = _upsert_records_arg(inputs)
+    fields = _upsert_check_fields(inputs, records)
+
+    existing = _upsert_existing(module, records, fields)
+    updates, creates = _upsert_split(records, fields, existing)
+
+    ids = [u["id"] for u in updates]
+    current = _read_by_ids(module, ids, ["Modified_Time"]) if ids else []
+    fingerprint, _snapshot = _fingerprint(module, current, ["Modified_Time"])
+    _plan_save(_upsert_key(module, records, fields),
+               {"fingerprint": fingerprint,
+                "update_ids": ids,
+                "updates": len(updates),
+                "creates": len(creates)})
+
+    _calls = (len(records) + _UPSERT_CALL - 1) // _UPSERT_CALL
+    return {
+        "ok": True,
+        "module": module,
+        "duplicate_check_fields": fields,
+        "total": len(records),
+        "will_update": len(updates),
+        "will_create": len(creates),
+        "updates": updates,
+        "creates": creates,
+        "calls_required": (len(records) + _UPSERT_CALL - 1) // _UPSERT_CALL,
+        "expires_in_minutes": _PLAN_TTL // 60,
+        "drift_covers": "the %d records that already exist; the %d being "
+                        "created have no prior state to move"
+                        % (len(updates), len(creates)),
+        "summary": (
+            "%d records matched on %s: %d already exist and would be updated, "
+            "%d would be created. Zoho takes %d per call, so this runs as %d "
+            "%s. Drift detection covers the %d existing records only - a "
+            "record that does not exist yet has nothing that can move. Run "
+            "zoho.apply_upsert with the same inputs to commit."
+            % (len(records), ", ".join(fields), len(updates), len(creates),
+               _UPSERT_CALL, _calls, "call" if _calls == 1 else "calls",
+               len(updates))),
+        "origin": _origin(stamp),
+    }, None
+
+
+def zoho_apply_upsert(inputs, stamp):
+    """Commit an upsert plan, refusing if any existing record moved since it
+    was made.
+
+    Batched at Zoho's 100 per call. A batch that fails partway is reported per
+    record: Zoho answers HTTP 200 even when some rows fail, so succeeded and
+    failed are counted from the response body rather than the status code.
+    """
+    module = _module_name(inputs)
+    records = _upsert_records_arg(inputs)
+    fields = _upsert_check_fields(inputs, records)
+    key = _upsert_key(module, records, fields)
+
+    stored = _plan_load(key)
+    if not stored:
+        raise RuntimeError(
+            "No current plan for this upsert. Run zoho.plan_upsert first, read "
+            "the create/update split, then apply with the same module, records "
+            "and duplicate_check_fields. Plans expire after %d minutes."
+            % (_PLAN_TTL // 60))
+
+    ids = list(stored.get("update_ids") or [])
+    current = _read_by_ids(module, ids, ["Modified_Time"]) if ids else []
+    actual, _snapshot = _fingerprint(module, current, ["Modified_Time"])
+    expected = str(stored.get("fingerprint") or "")
+
+    if actual != expected:
+        _ledger_append(_ledger_note(
+            "refused", "apply_upsert", module, key,
+            {"reason": "an existing record moved between plan and apply",
+             "expected": expected, "actual": actual,
+             "updates": len(ids), "creates": stored.get("creates")}))
+        raise RuntimeError(
+            "Refusing to upsert. One of the %d records that already exist "
+            "moved since the plan was made: the state fingerprint is %s, not "
+            "%s. Re-run zoho.plan_upsert and review the new split."
+            % (len(ids), actual[:23] + "...", expected[:23] + "..."))
+
+    succeeded, failed, errors = 0, 0, []
+    for start in range(0, len(records), _UPSERT_CALL):
+        batch = records[start:start + _UPSERT_CALL]
+        body = {"data": batch, "duplicate_check_fields": fields}
+        response = _call("POST", "%s/upsert" % module, body=body)
+        for row in (response.get("data") or []):
+            if (row or {}).get("code") == "SUCCESS":
+                succeeded += 1
+            else:
+                failed += 1
+                if len(errors) < 20:
+                    errors.append(row)
+
+    entry = _ledger_append(_ledger_note(
+        "applied", "apply_upsert", module, key,
+        {"records": len(records), "fields": fields, "fingerprint": expected,
+         "updated": stored.get("updates"), "created": stored.get("creates"),
+         "succeeded": succeeded, "failed": failed}))
+
+    _done_calls = (len(records) + _UPSERT_CALL - 1) // _UPSERT_CALL
+    return {
+        "ok": not failed,
+        "action": "upsert %d records into %s" % (len(records), module),
+        "succeeded": succeeded,
+        "failed": failed,
+        "errors": errors,
+        "planned_updates": stored.get("updates"),
+        "planned_creates": stored.get("creates"),
+        "fingerprint_verified": expected,
+        "ledger_seq": entry["seq"],
+        "summary": (
+            "Upserted %d of %d records into %s across %d %s. The plan said "
+            "%s would be updated and %s created. Zoho answers HTTP 200 even "
+            "when rows fail, so these counts come from the response body."
+            % (succeeded, len(records), module, _done_calls,
+               "call" if _done_calls == 1 else "calls",
+               stored.get("updates"), stored.get("creates"))),
+        "origin": _origin(stamp),
+    }, None
+
+
+
+# =============================================================================
+# HYGIENE + READINESS  -  paste into handler.py after zoho_apply_upsert.
+#
+# Both read-only. Neither needs a scope this module does not already have.
+#
+# Every field name below returned a valid COQL result against the live org on
+# 2026-08-03. A check whose field is rejected reports itself as unavailable
+# rather than silently counting zero - a hygiene report that under-reports is
+# worse than one that admits a gap.
+# =============================================================================
+
+def _iso_days_ago(days):
+    return time.strftime("%Y-%m-%dT%H:%M:%S+05:30",
+                         time.gmtime(time.time() - days * 86400))
+
+
+def _iso_date_days_ago(days):
+    return time.strftime("%Y-%m-%d", time.gmtime(time.time() - days * 86400))
+
+
+def _hygiene_checks(stale_days):
+    """(key, module, label, why, COQL) for each check.
+
+    Field names verified live. `owner_gone` is filled in per call because it
+    needs the departed users, so it is not in this table.
+    """
+    since_ts = _iso_days_ago(stale_days)
+    today = _iso_date_days_ago(0)
+    return [
+        ("stale_leads", "Leads",
+         "Leads untouched for %d days" % stale_days,
+         "Nobody has worked these. They are either dead or being ignored.",
+         "select id, Last_Name, Lead_Status, Modified_Time from Leads "
+         "where Modified_Time < '%s'" % since_ts),
+
+        ("stale_deals", "Deals",
+         "Open deals untouched for %d days" % stale_days,
+         "An open deal nobody has touched in months is a forecast that is "
+         "quietly wrong.",
+         "select id, Deal_Name, Stage, Modified_Time from Deals "
+         "where Modified_Time < '%s' and Stage not in "
+         "('Closed Won','Closed Lost')" % since_ts),
+
+        ("overdue_deals", "Deals",
+         "Deals past their closing date, still open",
+         "The close date has passed and the stage has not moved. The pipeline "
+         "says one thing and the calendar says another.",
+         "select id, Deal_Name, Stage, Closing_Date from Deals "
+         "where Closing_Date < '%s' and Stage not in "
+         "('Closed Won','Closed Lost')" % today),
+
+        ("leads_no_email", "Leads",
+         "Leads with no email address",
+         "Nothing automated can reach these, and nobody will notice until a "
+         "campaign silently skips them.",
+         "select id, Last_Name, Company from Leads where Email is null"),
+
+        ("contacts_no_email", "Contacts",
+         "Contacts with no email address",
+         "Same problem, on the records that matter more.",
+         "select id, Last_Name, Account_Name from Contacts where Email is null"),
+    ]
+
+
+def _hygiene_owner_checks(departed_ids, departed_names):
+    if not departed_ids:
+        return []
+    id_list = ", ".join("'%s'" % str(i) for i in departed_ids)
+    who = ", ".join(departed_names) if departed_names else "an inactive user"
+    out = []
+    for module, label_field in (("Leads", "Last_Name"), ("Deals", "Deal_Name"),
+                                ("Contacts", "Last_Name"),
+                                ("Accounts", "Account_Name")):
+        out.append((
+            "orphaned_%s" % module.lower(), module,
+            "%s owned by a deactivated user" % module,
+            "Owned by %s, who is no longer active. Nobody is working these and "
+            "nobody knows it." % who,
+            "select id, %s, Owner from %s where Owner in (%s)"
+            % (label_field, module, id_list)))
+    return out
+
+
+def zoho_hygiene_scan(inputs, stamp):
+    """Find what is quietly rotting in the CRM. Read-only.
+
+    Zoho's own reports will tell you these numbers. What it will not do is hand
+    the result to a governed write: every finding here names the command that
+    fixes it, and that command still plans, fingerprints and refuses on drift.
+
+    A check whose field the org rejects is reported as unavailable rather than
+    counted as zero. A hygiene report that quietly under-reports is worse than
+    one that admits a gap.
+
+    inputs: stale_days (number, default 90), include (array of check keys,
+            optional), sample (number, default 5)
+    """
+    # `or 90` would swallow a deliberate 0 and silently scan 90 days instead.
+    raw_days = inputs.get("stale_days")
+    stale_days = 90 if raw_days in (None, "") else int(raw_days)
+    if stale_days < 1:
+        raise RuntimeError("'stale_days' must be at least 1; %r would scan "
+                           "everything." % raw_days)
+    raw_sample = inputs.get("sample")
+    sample = 5 if raw_sample in (None, "") else int(raw_sample)
+    sample = max(0, min(sample, 25))
+    wanted = inputs.get("include")
+    if isinstance(wanted, str):
+        wanted = [wanted]
+    wanted = set(wanted) if isinstance(wanted, list) and wanted else None
+
+    # Deactivated users, so their records can be found. list_users already
+    # exposes this; the scan reuses the same call rather than a new scope.
+    departed_ids, departed_names = [], []
+    try:
+        users = (_call("GET", "users", params={"type": "AllUsers"})
+                 .get("users") or [])
+        for u in users:
+            active = u.get("status")
+            if active and str(active).lower() != "active":
+                departed_ids.append(str(u.get("id")))
+                departed_names.append(str(u.get("full_name")
+                                           or u.get("email") or u.get("id")))
+    except Exception:
+        departed_ids, departed_names = [], []
+
+    checks = _hygiene_checks(stale_days) + _hygiene_owner_checks(
+        departed_ids, departed_names)
+
+    findings, unavailable, total = [], [], 0
+    for key, module, label, why, query in checks:
+        if wanted and key not in wanted:
+            continue
+        try:
+            rows = _coql_all(query, cap=_SCAN_CAP, label=label)
+        except Exception as e:                                  # noqa: BLE001
+            unavailable.append({"check": key, "module": module,
+                                "label": label, "reason": str(e)[:160]})
+            continue
+        if not rows:
+            continue
+        total += len(rows)
+        findings.append({
+            "check": key,
+            "module": module,
+            "label": label,
+            "why_it_matters": why,
+            "count": len(rows),
+            "sample": rows[:sample],
+            "query": query,
+            "fix_with": ("zoho.plan_handover" if key.startswith("orphaned_")
+                         else "zoho.plan_update"),
+        })
+
+    findings.sort(key=lambda f: -f["count"])
+
+    # Write the full findings to a file and return the path.
+    #
+    # redact_output scrubs identifiers AND date-shaped values before sealing a
+    # receipt: a sample row comes back with "id": "[account]" and
+    # "Closing_Date": "[date]", and the COQL string loses its date literal, so
+    # the query cannot be pasted into plan_update - which is the one thing it
+    # is there for. Verified live on station v0.61.
+    #
+    # audit_pack already proves a file path survives redaction, so the same
+    # move works here: counts and labels inline for the operator to scan, the
+    # actionable detail in a file they can open.
+    helpers = __rc_helpers__  # noqa: F821
+    name = "hygiene_scan" + time.strftime(".%Y%m%dT%H%M%SZ", time.gmtime()) + ".json"
+    path = str(helpers.get("WS") or "").rstrip("/") + "/" + name
+    helpers["jsave"](path, {
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "stale_days": stale_days,
+        "deactivated_users": departed_names,
+        "findings": findings,
+        "unavailable": unavailable,
+        "note": "Queries and sample rows here are unredacted; the same values "
+                "come back as [account] and [date] through a receipt.",
+    })
+
+    # Inline: everything that survives redaction and is worth scanning. The
+    # per-finding query and sample rows live in the file, not here.
+    inline = [{"check": f["check"], "module": f["module"], "label": f["label"],
+               "why_it_matters": f["why_it_matters"], "count": f["count"],
+               "fix_with": f["fix_with"]} for f in findings]
+
+    return {
+        "ok": True,
+        "stale_days": stale_days,
+        "checks_run": len(checks) if not wanted else len(findings) + len(unavailable),
+        "findings": inline,
+        "report_path": path,
+        "issues_found": len(findings),
+        "records_affected": total,
+        "unavailable": unavailable,
+        "deactivated_users": departed_names,
+        "summary": (
+            "%d issue type(s) across %d records. %sThe full report, with the "
+            "COQL behind each finding and the matching record ids, is at %s - "
+            "receipts redact identifiers and dates, so the query is in the "
+            "file rather than here. Feed it to zoho.plan_update, or reassign "
+            "an inactive user's book with zoho.plan_handover; either way that "
+            "write still fingerprints and still refuses on drift. Nothing "
+            "here changes anything."
+            % (len(findings), total,
+               ("%d check(s) could not run and are listed under unavailable; "
+                "they are not counted as zero. " % len(unavailable))
+               if unavailable else "", name)),
+        "origin": _origin(stamp),
+    }, None
+
+
+def zoho_check_readiness(inputs, stamp):
+    """Check one record against the fields the module says are required, plus
+    any you name. Read-only.
+
+    Zoho enforces required fields on its own forms. It does not enforce them
+    on an API write, and it does not enforce your rules at all - the ones that
+    are not about validity but about a record being ready to act on. A deal
+    with no closing date will save happily and then sit in a forecast being
+    wrong.
+
+    inputs: module, record_id, require (array of extra field api_names,
+            optional)
+    """
+    module = _module_name(inputs)
+    record_id = _record_id(inputs)
+
+    extra = inputs.get("require")
+    if isinstance(extra, str):
+        extra = [extra]
+    extra = [str(f).strip() for f in (extra or []) if str(f).strip()]
+
+    meta = _call("GET", "settings/fields", params={"module": module})
+    declared = []
+    for f in (meta.get("fields") or []):
+        api = f.get("api_name")
+        if not api or f.get("read_only"):
+            continue
+        if f.get("system_mandatory") or f.get("required"):
+            declared.append(api)
+
+    response = _call("GET", "%s/%s" % (module, record_id))
+    rows = response.get("data") or []
+    if not rows:
+        raise RuntimeError("Record %s not found in %s." % (record_id, module))
+    record = rows[0]
+
+    def _empty(value):
+        return value in (None, "", [], {})
+
+    missing_required, missing_requested, present = [], [], []
+    for field in sorted(set(declared)):
+        (missing_required if _empty(record.get(field)) else present).append(field)
+    for field in extra:
+        if field not in record:
+            missing_requested.append({"field": field,
+                                      "note": "not a field on this module"})
+        elif _empty(record.get(field)):
+            missing_requested.append({"field": field, "note": "empty"})
+
+    ready = not missing_required and not missing_requested
+    return {
+        "ok": True,
+        "module": module,
+        "record_id": record_id,
+        "ready": ready,
+        "missing_required": missing_required,
+        "missing_requested": missing_requested,
+        "required_fields_checked": len(declared),
+        "extra_fields_checked": len(extra),
+        "summary": (
+            "Record is ready: %d module-required field(s) present%s."
+            % (len(present),
+               (" and all %d requested field(s) filled" % len(extra))
+               if extra else "")
+            if ready else
+            "Record is NOT ready. Missing %d module-required field(s)%s. "
+            "Zoho will accept an API write anyway - it enforces required "
+            "fields on its own forms, not on the API - so this is the check "
+            "that does not otherwise happen."
+            % (len(missing_required),
+               (" and %d requested field(s)" % len(missing_requested))
+               if missing_requested else "")),
+        "origin": _origin(stamp),
+    }, None
 
 
 def zoho_plan_handover(inputs, stamp):

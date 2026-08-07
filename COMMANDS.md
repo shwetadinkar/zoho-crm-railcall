@@ -1,7 +1,7 @@
 # shweta/zoho-crm - command reference
 
-Twenty-two commands. Twelve reads, which run without approval. Ten writes,
-which stop at the airlock until a human approves the exact payload.
+Twenty-eight commands. Sixteen reads, which run without approval. Twelve
+writes, which stop at the airlock until a human approves the exact payload.
 
 Examples below use Zoho's own demo records, so you can follow along in a fresh
 trial org.
@@ -398,6 +398,281 @@ whatever the other person did.
 **Errors.** Raises if the ledger holds no applied change for these three inputs.
 Also raises for entries written before 0.6.0, which do not carry prior values.
 
+## zoho.plan_merge
+
+Works out exactly what a merge would destroy, without merging anything.
+Read-only.
+
+Merge is the most destructive operation this module reaches, and the least
+visible afterwards. Verified against a live org on 2026-08-03:
+
+- the master's field values win; the loser's are lost with no record
+- notes, tasks, calls, events and attachments are REPARENTED to the master
+- the losing record is gone: a direct fetch returns 204, and it is invisible
+  to COQL
+- its recycle-bin entry has no `display_name` and no `deleted_by`, so an
+  operator opening the bin sees an unidentifiable blank row
+- `PUT /actions/restore` answers HTTP 200 with an empty body and does nothing
+
+So there is no undo, no usable bin entry, and no attribution. And merging is
+routine - housekeeping, done casually, by whoever notices the duplicate. This
+preview is the only chance to notice the wrong record was chosen as master.
+
+| input | type | required | notes |
+|---|---|---|---|
+| `module` | string | yes | `Leads` or `Contacts` |
+| `master_id` | string | yes | the record that survives |
+| `loser_ids` | array | yes | records to merge in, max 3 per call |
+
+```json
+{
+  "module": "Leads",
+  "master_id": "1352736000000533111",
+  "loser_ids": ["1352736000000533106"]
+}
+```
+
+```json
+{
+  "ok": true,
+  "module": "Leads",
+  "master_id": "1352736000000533111",
+  "count": 1,
+  "conflicting_fields": 2,
+  "related_records_moving": 12,
+  "irreversible": true,
+  "losers": [
+    {
+      "id": "1352736000000533106",
+      "conflicts": [
+        {"field": "Phone", "master": "+91 98200 11111", "loser": "+91 99300 22222"},
+        {"field": "Lead_Status", "master": "Contacted", "loser": "Qualified"}
+      ],
+      "only_on_loser": [{"field": "Secondary_Email", "loser": "ada.l@acme.com"}],
+      "related": {
+        "Notes": {"count": 9, "titles": ["Call 12 Mar", "Renewal terms"]},
+        "Tasks": {"count": 3, "titles": ["Follow up"]},
+        "Calls": {"count": 0, "titles": []},
+        "Events": {"count": 0, "titles": []},
+        "Attachments": {"count": 0, "titles": []}
+      },
+      "modified_time": "2026-07-29T18:44:09+05:30",
+      "modified_by": "Shweta D"
+    }
+  ]
+}
+```
+
+`conflicts` is the point of the command. The master wins silently, so an
+operator has to see the phone number that is about to disappear while they can
+still swap which record is the master. `only_on_loser` is the opposite case:
+values the master lacks, which survive the merge.
+
+**System stamps are filtered out.** `Created_Time`, `Modified_Time`,
+`Last_Activity_Time`, `Change_Log_Time__s`, anything in Zoho's `$` namespace
+and anything ending `_Time` always differ between two records and are never
+something an operator can act on. A live preview of two test records reported
+seven conflicts, four of which were timestamps - enough noise to bury the
+three that mattered. They are counted in `system_fields_differing` rather than
+dropped silently.
+
+**Restricted to Leads and Contacts.** Merge is verified on those two. Accounts
+and Deals may behave differently and this command will not guess about an
+operation that cannot be undone.
+
+**Related lists are read through COQL**, not the nested REST route. On v8,
+`GET Leads/{id}/Notes` and its siblings answer 400 REQUIRED_PARAM_MISSING;
+`select id from Tasks where What_Id = '...'` works. A related list that cannot
+be read is reported as `count: null` rather than silently counted as zero.
+
+**Errors.** Raises if the module is not Leads or Contacts, if `master_id`
+appears in `loser_ids`, if `loser_ids` holds duplicates or more than three ids,
+or if any record does not exist.
+
+## zoho.plan_upsert
+
+Works out which records a bulk upsert would create and which it would update,
+without writing anything. Read-only.
+
+`upsert_records` handles one call of up to 100. This is the governed form for a
+larger set: it pages the duplicate-check lookup to completion, reports the
+split, and fingerprints the records that already exist so `apply_upsert` can
+refuse if they move.
+
+| input | type | required | notes |
+|---|---|---|---|
+| `module` | string | yes | module API name |
+| `records` | array | yes | objects to insert or update, up to 2000 |
+| `duplicate_check_fields` | array | yes | fields Zoho matches on |
+
+```json
+{
+  "module": "Leads",
+  "records": [
+    {"Email": "ada@acme.com", "Last_Name": "Lovelace", "Lead_Status": "Contacted"},
+    {"Email": "grace@acme.com", "Last_Name": "Hopper", "Lead_Status": "New"}
+  ],
+  "duplicate_check_fields": ["Email"]
+}
+```
+
+```json
+{
+  "ok": true,
+  "module": "Leads",
+  "duplicate_check_fields": ["Email"],
+  "total": 2,
+  "will_update": 1,
+  "will_create": 1,
+  "calls_required": 1,
+  "updates": [
+    {"id": "1352736000000533111", "matched_on": "Email",
+     "matched_value": "ada@acme.com",
+     "modified_time": "2026-07-29T18:44:09+05:30"}
+  ],
+  "creates": [{"Email": "grace@acme.com"}],
+  "drift_covers": "the 1 records that already exist; the 1 being created have no prior state to move"
+}
+```
+
+**The drift guarantee here is narrower than `plan_update`'s, and the output
+says so.** A record that does not exist yet has no prior state, so there is
+nothing to fingerprint and nothing that can move. `apply_upsert` re-checks the
+records in `updates`; the ones in `creates` are unguarded by construction.
+
+Every record must carry the duplicate-check fields. Without them the plan
+cannot tell an insert from an update, so the command refuses rather than
+guessing.
+
+The lookup is one COQL per check field rather than one per record: a set of 500
+would otherwise be 500 round trips.
+
+**Errors.** Raises if `duplicate_check_fields` is missing, if any record lacks
+one of them, or if the set exceeds 2000 records.
+
+## zoho.hygiene_scan
+
+Finds what is quietly rotting in the CRM. Read-only, changes nothing.
+
+Zoho's own reports will give you these numbers. What they will not do is hand
+the result to a governed write. Every finding here names the command that fixes
+it and carries the COQL that produced it - in the report file, for the reason
+below - and that command still plans, still fingerprints, still refuses on
+drift.
+
+| input | type | required | notes |
+|---|---|---|---|
+| `stale_days` | number | no | days without a change that counts as stale, default 90 |
+| `include` | array | no | restrict to named checks; omit to run all |
+| `sample` | number | no | example records per finding, max 25, default 5 |
+
+Checks run:
+
+| key | what it finds | why it matters |
+|---|---|---|
+| `stale_leads` | leads untouched for `stale_days` | dead, or being ignored |
+| `stale_deals` | open deals untouched for `stale_days` | a forecast that is quietly wrong |
+| `overdue_deals` | deals past their closing date, still open | the pipeline and the calendar disagree |
+| `leads_no_email` | leads with no email | nothing automated can reach them |
+| `contacts_no_email` | contacts with no email | same, on records that matter more |
+| `orphaned_*` | records owned by a deactivated user | nobody is working these and nobody knows |
+
+```json
+{ "stale_days": 120, "sample": 3 }
+```
+
+```json
+{
+  "ok": true,
+  "stale_days": 120,
+  "issues_found": 2,
+  "records_affected": 47,
+  "deactivated_users": ["Priya N"],
+  "report_path": "/home/you/.railcall/station/.railcall_workspace/hygiene_scan.20260807T151227Z.json",
+  "findings": [
+    {
+      "check": "orphaned_leads",
+      "module": "Leads",
+      "label": "Leads owned by a deactivated user",
+      "why_it_matters": "Owned by Priya N, who is no longer active. Nobody is working these and nobody knows it.",
+      "count": 31,
+      "fix_with": "zoho.plan_handover"
+    }
+  ],
+  "unavailable": []
+}
+```
+
+**The COQL and the matching record ids are in the file, not in the response.**
+`redact_output` scrubs identifiers *and* date-shaped values before sealing a
+receipt: a sample row comes back as `"id": "[account]"`,
+`"Closing_Date": "[date]"`, and a query loses its date literal - which makes it
+unpastable, and pasting it into `plan_update` is the one thing it is for.
+Verified on station v0.61.
+
+So the counts, labels and reasoning stay inline where an operator can scan
+them, and the actionable half goes to `report_path`. The file holds each
+finding's full `query` and `sample` rows, unredacted.
+
+**A check that cannot run is reported, not counted as zero.** If a field name
+is rejected by your org, the check lands in `unavailable` with the error. A
+hygiene report that quietly under-reports is worse than one that admits a gap.
+
+Checks with no matches are omitted entirely - silence is the healthy case, and
+a list of zeroes buries the findings that matter.
+
+`fix_with` names `zoho.plan_handover` for orphaned records and
+`zoho.plan_update` for the rest. Open the report file and feed the finding's
+`query` straight to that plan command.
+
+**Errors.** Raises if `stale_days` is below 1. Note that `0` is rejected
+rather than treated as absent.
+
+## zoho.check_readiness
+
+Checks one record against the fields the module says are required, plus any you
+name. Read-only.
+
+Zoho enforces required fields on its own forms. It does **not** enforce them on
+an API write, and it does not enforce your rules at all - the ones that are not
+about validity but about a record being ready to act on. A deal with no closing
+date saves happily and then sits in a forecast being wrong.
+
+| input | type | required | notes |
+|---|---|---|---|
+| `module` | string | yes | module API name |
+| `record_id` | string | yes | the record to check |
+| `require` | array | no | extra field api_names that must be filled |
+
+```json
+{
+  "module": "Deals",
+  "record_id": "1352736000000533152",
+  "require": ["Closing_Date", "Amount", "Contact_Name"]
+}
+```
+
+```json
+{
+  "ok": true,
+  "module": "Deals",
+  "record_id": "1352736000000533152",
+  "ready": false,
+  "missing_required": ["Stage"],
+  "missing_requested": [
+    {"field": "Closing_Date", "note": "empty"},
+    {"field": "Contract_Ref", "note": "not a field on this module"}
+  ],
+  "required_fields_checked": 4
+}
+```
+
+Read-only fields are skipped even when the module marks them mandatory: a field
+nobody can fill in is not a readiness problem.
+
+A requested field that does not exist on the module is reported as such rather
+than as empty, so a typo in `require` surfaces instead of failing silently.
+
 ## zoho.verify_ledger
 
 Recomputes every link in the local change ledger and reports whether it holds.
@@ -604,6 +879,81 @@ deleted record cannot be restored by a write; the ledger entry for a delete is a
 record of what was removed, not rollback data. Zoho's recycle bin holds deletions
 for 60 days.
 
+## zoho.apply_merge
+
+Commits a plan from `zoho.plan_merge`. Inputs are the same three: `module`,
+`master_id`, `loser_ids`.
+
+Re-reads every record involved - the master included, since its values are the
+ones that win - re-hashes, and refuses if anything moved. Drift matters more
+here than anywhere else in this module: an update can be rolled back and a
+delete sits in the recycle bin for 60 days, but a merge cannot be taken back at
+all.
+
+```json
+{
+  "ok": true,
+  "action": "merge into Leads/1352736000000533111",
+  "master_id": "1352736000000533111",
+  "succeeded": 1,
+  "failed": 0,
+  "merged": ["1352736000000533106"],
+  "errors": [],
+  "fingerprint_verified": "sha256:127366c7...",
+  "ledger_seq": 41,
+  "recoverable": false
+}
+```
+
+**The ledger entry is written before the merge fires.** Everywhere else in this
+module the ledger writes after the API call, because recording a change that
+never happened is worse than missing one. Here the reasoning inverts: a merge
+with no record of what the loser held is unrecoverable in a way an unrecorded
+update is not, and Zoho's own bin entry is useless. If the ledger write fails,
+the merge does not proceed.
+
+That entry holds the loser's complete record and its related-list counts. After
+the merge it is the only readable copy anywhere.
+
+**One loser per API call.** Zoho accepts a list under `data[]`, but a batched
+failure halfway through leaves no way to say which records were merged and
+which were not. `succeeded`, `failed` and `errors` are per record.
+
+**No rollback.** `plan_rollback` covers `apply_update` only. The ledger entry
+is a reference - someone can look up the value that vanished and re-enter it by
+hand - not an undo. The record itself cannot be restored, and the reparented
+notes cannot be unpicked.
+
+## zoho.apply_upsert
+
+Commits a plan from `zoho.plan_upsert`. Inputs are the same three: `module`,
+`records`, `duplicate_check_fields`.
+
+Re-reads the records that already existed, re-hashes, and refuses if any of
+them moved. Then writes in batches of 100, Zoho's ceiling.
+
+```json
+{
+  "ok": true,
+  "action": "upsert 250 records into Leads",
+  "succeeded": 248,
+  "failed": 2,
+  "errors": [{"code": "DUPLICATE_DATA", "message": "duplicate data"}],
+  "planned_updates": 90,
+  "planned_creates": 160,
+  "fingerprint_verified": "sha256:127366c7...",
+  "ledger_seq": 44
+}
+```
+
+**`succeeded` and `failed` come from the response body, not the status code.**
+Zoho answers HTTP 200 even when some rows in a batch fail. A caller reading
+only the status would report a clean run on a batch where forty records were
+rejected.
+
+On drift the refusal is written to the ledger and the command raises, same as
+every other apply in this module.
+
 ## zoho.create_record
 
 | input | type | required | notes |
@@ -779,6 +1129,21 @@ what is on record.
 
 **"Refusing to roll back"** - the records moved between the rollback plan and the
 rollback apply. Re-plan and review.
+
+**"Refusing to merge"** - one of the records moved between the merge plan and
+the apply. A merge cannot be undone, so re-plan and read the new diff.
+
+**"Merge is verified on Leads and Contacts only"** - the module declines to
+guess how merge behaves on Accounts or Deals.
+
+**"Refusing to upsert"** - one of the records that already existed moved
+between the plan and the apply. Re-plan and review the new split.
+
+**"Every record must carry the duplicate-check fields"** - without them the
+plan cannot separate inserts from updates.
+
+**"'stale_days' must be at least 1"** - `hygiene_scan` rejects 0 rather than
+quietly falling back to the 90-day default.
 
 **"matches more than 2000 records"** - a scan refuses rather than acting on a
 partial set. Narrow the query.
