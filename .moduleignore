@@ -8,3 +8,5 @@ merge_experiment_state.json
 backup_*.json
 apply_061.py
 shweta_governed_handover.json
+*.bak
+*.bak[0-9]
