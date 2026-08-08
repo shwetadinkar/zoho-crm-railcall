@@ -944,6 +944,69 @@
       "description": "Commits a plan from zoho.plan_upsert, batched at Zoho's 100 per call. Zoho answers HTTP 200 even when rows fail, so succeeded and failed are counted from the response body."
     },
     {
+      "id": "zoho.scan_changes",
+      "title": "Scan for record changes since the last run",
+      "provider": "zoho",
+      "risk": "low",
+      "mode": "read",
+      "requires": [
+        "ZOHO_OAUTH"
+      ],
+      "preview": true,
+      "receipt_required": true,
+      "input_schema": {
+        "modules": {
+          "type": "array",
+          "required": false,
+          "description": "Zoho API names to scan. Default: Leads, Contacts, Accounts, Deals."
+        },
+        "limit": {
+          "type": "number",
+          "required": false,
+          "description": "A SAFETY CAP per module when 'since' is set, not a selector."
+        },
+        "since": {
+          "type": "string",
+          "required": false,
+          "description": "ISO-8601 UTC. Injected by the station's incremental scheduler."
+        },
+        "exclude_ids": {
+          "type": "array",
+          "required": false,
+          "description": "Change refs already delivered. Injected by the scheduler."
+        }
+      },
+      "output_schema": {
+        "count": "number",
+        "changes": "array",
+        "since": "string",
+        "rows_scanned": "number",
+        "skipped_already_delivered": "number",
+        "ungoverned_count": "number",
+        "truncated": "boolean",
+        "report_path": "string",
+        "ledger_covers_from": "string",
+        "unmatchable_ledger_entries": "number",
+        "summary": "string"
+      },
+      "schedulable": {
+        "min_interval_minutes": 15,
+        "max_runtime_minutes": 10,
+        "concurrency": "skip"
+      },
+      "incremental": {
+        "since_param": "since",
+        "seen_param": "exclude_ids",
+        "items_field": "changes",
+        "cursor_field": "change_ref",
+        "watermark_from": "modified_at",
+        "watermark_type": "timestamp",
+        "initial": "today",
+        "lookback_seconds": 1800,
+        "seen_window_seconds": 14400
+      }
+    },
+    {
       "id": "zoho.hygiene_scan",
       "title": "Find what is quietly rotting: stale records, orphaned owners, overdue deals",
       "provider": "zoho",

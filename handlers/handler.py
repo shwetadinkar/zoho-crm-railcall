@@ -20,6 +20,7 @@ PUT: __rc_helpers__ ships GET, POST, PATCH and DELETE. Zoho's record update
 wants PUT, so _put does that one by hand.
 """
 
+import calendar
 import hashlib
 import json as _json
 import random
@@ -618,6 +619,87 @@ _DELETE_GUARD_FIELDS = ["Modified_Time"]
 
 _COQL_PAGE = 200          # Zoho's per-call ceiling
 _SCAN_CAP = 2000          # refuse past this rather than half-report
+_SCAN_MODULES = ("Leads", "Contacts", "Accounts", "Deals")
+_SCAN_CHANGES_CAP = 500   # per module per run; truncated plus the seen set
+                          # drain a backlog, so a smaller cap costs nothing
+
+
+def _iso_utc(value):
+    """Normalise a Zoho timestamp to ISO-8601 UTC, or None if unreadable.
+
+    Zoho renders explicit offsets: 2026-08-08T16:44:05+05:30. Stripping the
+    offset instead of converting it would make every record look 5.5 hours
+    newer than it is, drag a watermark into the future, and permanently drop
+    everything modified in the next 5.5 hours. The offset is half-hourly on
+    this datacenter, so hour arithmetic is wrong too.
+
+    Returns None rather than raising. One unreadable cell must not abort a
+    scan, and a caller treats an unreadable timestamp as a change to surface
+    rather than one to skip: a row we cannot prove is old must never silently
+    become a row we ignore.
+
+    Uses time/calendar rather than datetime to stay with the vocabulary the
+    rest of this module already uses for the ledger.
+    """
+    if not value or not isinstance(value, str):
+        return None
+    text = value.strip()
+    try:
+        secs = calendar.timegm(time.strptime(text[:19], "%Y-%m-%dT%H:%M:%S"))
+    except (ValueError, TypeError):
+        return None
+    offset = text[19:]
+    if offset in ("", "Z", "z"):
+        pass
+    elif offset[0] in "+-" and len(offset) >= 6 and offset[3] == ":":
+        try:
+            hours, minutes = int(offset[1:3]), int(offset[4:6])
+        except ValueError:
+            return None
+        secs -= (1 if offset[0] == "+" else -1) * (hours * 3600 + minutes * 60)
+    else:
+        return None
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(secs))
+
+
+def _governed_index():
+    """What the ledger can vouch for, and where its knowledge starts.
+
+    Returns (governed, covers_from, unmatchable).
+
+    `governed` holds "module:id:modified_at" keys built from the post-write
+    Modified_Time this module recorded. Zoho returns that value on every
+    SUCCESS row and it is byte-identical to a later read, so a change either
+    matches an approval exactly or it does not. No tolerance window: a UI edit
+    landing one second after a module write stays visible.
+
+    `covers_from` is the earliest entry in the live chain. The ledger rotates
+    past _LEDGER_MAX into sealed archives this does not read, so claiming
+    coverage before that point would report governed changes as ungoverned.
+
+    `unmatchable` counts applied entries with no recorded Modified_Time --
+    everything written before the ledger began recording it, plus every merge,
+    which Zoho's merge response does not timestamp. Those are real approvals
+    this cannot match, so the count is reported rather than their records being
+    quietly called ungoverned.
+    """
+    governed, unmatchable, covers_from = set(), 0, None
+    for entry in (_ledger_load().get("entries") or []):
+        at = entry.get("at")
+        if at and (covers_from is None or at < covers_from):
+            covers_from = at
+        if entry.get("outcome") != "applied":
+            continue
+        rows = (entry.get("detail") or {}).get("written")
+        if not rows:
+            unmatchable += 1
+            continue
+        for row in rows:
+            rid = (row or {}).get("id")
+            stamp = _iso_utc((row or {}).get("modified_time"))
+            if rid and stamp:
+                governed.add("%s:%s:%s" % (entry.get("module"), rid, stamp))
+    return governed, covers_from, unmatchable
 
 
 def _strip_limit(query):
@@ -1728,6 +1810,151 @@ def _hygiene_owner_checks(departed_ids, departed_names):
             "select id, %s, Owner from %s where Owner in (%s)"
             % (label_field, module, id_list)))
     return out
+
+
+def zoho_scan_changes(inputs, stamp):
+    """Report records changed since the last run, and which nobody governed.
+
+    A scheduled read. The station holds the position and injects `since`; this
+    stores no watermark of its own, so a module update cannot silently skip a
+    window and leave nothing in a receipt to show for it.
+
+    It exists to close the ledger's largest gap. The ledger sees only what this
+    module wrote, so an edit made in the Zoho UI is invisible to it.
+    Modified_Time is not, so a scan can name changes that never passed through
+    an approval. A change counts as governed when this module recorded the
+    exact post-write Modified_Time Zoho returned - an exact match, not a
+    window, so a UI edit one second after a module write is still reported.
+
+    Ordering is ascending and mandatory. The cap truncates, and the station
+    advances its watermark to the newest row returned; in any other order a
+    truncated page leaves older rows behind the mark and they are never seen
+    again.
+
+    Honest limits, all of them:
+      - This finds ungoverned EDITS. A UI delete leaves nothing to poll, and a
+        UI merge makes the loser invisible to COQL.
+      - Coverage starts at the earliest entry in the live ledger chain. The
+        chain rotates; sealed archives are not read here.
+      - Entries written before the ledger recorded Modified_Time, and every
+        merge, cannot be matched. The count is reported, but their records may
+        appear as ungoverned when they were not.
+      - Modified_By is Zoho's record of who last touched the record. For writes
+        this module made it is always the OAuth user, so it names a person only
+        for changes the module did not make.
+      - Counts are inline; the records go to a file. redact_output scrubs ids
+        and dates out of a receipt, so anything actionable has to be a path.
+
+    inputs: modules (array, default Leads/Contacts/Accounts/Deals),
+            limit (number, cap per module), since and exclude_ids (injected)
+    """
+    helpers = __rc_helpers__  # noqa: F821
+    modules = inputs.get("modules") or list(_SCAN_MODULES)
+    if not isinstance(modules, list):
+        raise RuntimeError("'modules' must be a list of Zoho API names.")
+    cap = int(inputs.get("limit") or _SCAN_CHANGES_CAP)
+    since_raw = str(inputs.get("since") or "").strip()
+    seen = set(str(x) for x in (inputs.get("exclude_ids") or []))
+
+    since_utc = _iso_utc(since_raw) if since_raw else None
+    if since_raw and since_utc is None:
+        # The station injects this. Scanning from the beginning of time on an
+        # unreadable value would look like success while spending the day's
+        # API budget, so refuse and name the value that was rejected.
+        raise RuntimeError(
+            "'since' is not a timestamp this command can read: %r. Expected "
+            "ISO-8601, for example 2026-08-08T11:14:05Z." % since_raw)
+
+    governed, covers_from, unmatchable = _governed_index()
+
+    changes, ungoverned = [], []
+    rows_scanned, skipped_seen, truncated = 0, 0, False
+    for module in modules:
+        columns = "id, Modified_Time, Modified_By, Created_Time"
+        if since_utc:
+            # COQL compares in UTC and accepts a bare Z literal against a
+            # record stamped +05:30 (verified live); an unzoned literal is
+            # rejected outright, which is the safe way for it to fail.
+            where = "Modified_Time > '%s'" % since_utc
+        else:
+            where = "id is not null"
+        rows, hit_cap = _coql_capped(
+            "select %s from %s where %s order by Modified_Time asc"
+            % (columns, module, where),
+            cap=cap, label="change scan on " + module)
+        truncated = truncated or hit_cap
+        rows_scanned += len(rows)
+        for row in rows:
+            rid = row.get("id")
+            if not rid:
+                continue
+            at = _iso_utc(row.get("Modified_Time"))
+            # The cursor identifies a CHANGE, not a record. A record edited
+            # twice is two items; keying on id alone would have the station
+            # suppress the second edit as already delivered.
+            ref = "%s:%s:%s" % (module, rid, at or "unreadable")
+            if ref in seen:
+                skipped_seen += 1
+                continue
+            by = row.get("Modified_By") or {}
+            is_governed = at is not None and ref in governed
+            changes.append({"change_ref": ref, "module": module, "id": rid,
+                            "modified_at": at, "governed": is_governed})
+            if not is_governed:
+                ungoverned.append({
+                    "change_ref": ref, "module": module, "id": rid,
+                    "modified_at": at,
+                    "modified_at_raw": row.get("Modified_Time"),
+                    "modified_by": by.get("name"),
+                    "modified_by_id": by.get("id"),
+                    "created_at": row.get("Created_Time"),
+                })
+
+    name = "scan_changes" + time.strftime(".%Y%m%dT%H%M%SZ", time.gmtime()) + ".json"
+    path = str(helpers.get("WS") or "").rstrip("/") + "/" + name
+    helpers["jsave"](path, {
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "since": since_utc,
+        "modules": modules,
+        "ledger_covers_from": covers_from,
+        "unmatchable_ledger_entries": unmatchable,
+        "ungoverned": ungoverned,
+        "note": "Record ids here are unredacted; the same values come back as "
+                "[account] through a receipt.",
+    })
+
+    window = since_utc or "the start of the scan window"
+    if truncated:
+        summary = ("Hit the %d-record cap with more waiting. %d changes "
+                   "returned, %d with no ledger entry. The watermark will not "
+                   "advance past what was not returned, so the next run "
+                   "continues from here." % (cap, len(changes), len(ungoverned)))
+    elif not changes:
+        summary = "No changes since %s." % window
+    else:
+        summary = ("%d changes since %s. %d have no matching ledger entry and "
+                   "are listed in %s. Ledger coverage starts %s; %d applied "
+                   "entries cannot be matched."
+                   % (len(changes), window, len(ungoverned), path,
+                      covers_from or "never", unmatchable))
+
+    return {
+        "ok": True,
+        "count": len(changes),
+        "changes": changes,
+        "since": since_utc,
+        "rows_scanned": rows_scanned,
+        "skipped_already_delivered": skipped_seen,
+        "ungoverned_count": len(ungoverned),
+        "truncated": truncated,
+        "report_path": path,
+        "ledger_covers_from": covers_from,
+        "unmatchable_ledger_entries": unmatchable,
+        "covers": "ungoverned edits only; a UI delete or merge leaves nothing "
+                  "to poll",
+        "summary": summary,
+        "origin": _origin(stamp),
+    }, None
 
 
 def zoho_hygiene_scan(inputs, stamp):

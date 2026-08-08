@@ -1955,6 +1955,189 @@ def t_check_readiness_raises_on_a_missing_record():
         assert "not found" in str(e), e
 
 
+
+# ----------------------------------------------------------- scan_changes
+def _change_helpers(rows_by_module=None, ledger=None, saved=None, pages=None):
+    """COQL serves rows per module name; jload serves a seeded ledger.
+
+    _scan_helpers' jload always returns the default, so a seeded ledger needs
+    its own store here.
+    """
+    rows_by_module = rows_by_module or {}
+    store = {"/tmp/rc-test/zoho_ledger.json": ledger} if ledger else {}
+    seq = list(pages or [])
+
+    def _post(url, obj, **k):
+        q = (obj or {}).get("select_query", "")
+        if seq:
+            return 200, json.dumps(seq.pop(0)).encode()
+        for mod, rows in rows_by_module.items():
+            if " from %s " % mod in q:
+                return 200, json.dumps({"data": rows}).encode()
+        return 200, json.dumps({"data": []}).encode()
+
+    return {"oauth_refresh": lambda p, **k: {"access_token": "t",
+                                             "instance_url": "https://x"},
+            "http_get_json": lambda u, **k: (200, b'{"data":[]}'),
+            "http_post_json": _post,
+            "WS": "/tmp/rc-test",
+            "jload": lambda p2, default=None: store.get(
+                p2, default if default is not None else {}),
+            "jsave": (lambda p2, o: saved.__setitem__(p2, o))
+                     if saved is not None else (lambda p2, o: None)}
+
+
+def t_iso_utc_converts_the_half_hour_offset():
+    """+05:30 is not hour-aligned; hour arithmetic skews by 30 minutes."""
+    m = load(_change_helpers())
+    assert m._iso_utc("2026-08-08T16:44:05+05:30") == "2026-08-08T11:14:05Z"
+    assert m._iso_utc("2026-08-08T11:14:05Z") == "2026-08-08T11:14:05Z"
+    assert m._iso_utc("2026-08-08T06:14:05-05:00") == "2026-08-08T11:14:05Z"
+
+
+def t_iso_utc_returns_none_rather_than_raising():
+    """One unreadable cell must not abort a scan."""
+    m = load(_change_helpers())
+    for bad in ("", None, "not a date", "2026-08-08 16:44:05", 12345):
+        assert m._iso_utc(bad) is None, bad
+
+
+def t_scan_changes_marks_an_exact_ledger_match_governed():
+    ledger = {"chain_start": "0", "entries": [
+        {"outcome": "applied", "module": "Leads", "at": "2026-08-08T11:14:05Z",
+         "detail": {"written": [
+             {"id": "1", "modified_time": "2026-08-08T16:44:05+05:30"}]}}]}
+    h = _change_helpers(
+        rows_by_module={"Leads": [{"id": "1",
+                                   "Modified_Time": "2026-08-08T16:44:05+05:30"}]},
+        ledger=ledger)
+    m = load(h)
+    out, err = m.zoho_scan_changes({"modules": ["Leads"]}, {})
+    assert err is None
+    assert out["count"] == 1, out
+    assert out["changes"][0]["governed"] is True, out
+    assert out["ungoverned_count"] == 0, out
+
+
+def t_scan_changes_reports_a_second_later_edit_as_ungoverned():
+    """The point of an exact match: a UI edit right after a module write must
+    stay visible instead of hiding behind the approval."""
+    ledger = {"chain_start": "0", "entries": [
+        {"outcome": "applied", "module": "Leads", "at": "2026-08-08T11:14:05Z",
+         "detail": {"written": [
+             {"id": "1", "modified_time": "2026-08-08T16:44:05+05:30"}]}}]}
+    h = _change_helpers(
+        rows_by_module={"Leads": [{"id": "1",
+                                   "Modified_Time": "2026-08-08T16:44:06+05:30"}]},
+        ledger=ledger)
+    m = load(h)
+    out, _ = m.zoho_scan_changes({"modules": ["Leads"]}, {})
+    assert out["ungoverned_count"] == 1, out
+    assert out["changes"][0]["governed"] is False, out
+
+
+def t_scan_changes_cursor_identifies_a_change_not_a_record():
+    """Same id, two edits. Keying on id alone would have the station suppress
+    the second as already delivered."""
+    h = _change_helpers(rows_by_module={"Leads": [
+        {"id": "1", "Modified_Time": "2026-08-08T16:44:05+05:30"},
+        {"id": "1", "Modified_Time": "2026-08-08T17:10:00+05:30"}]})
+    m = load(h)
+    out, _ = m.zoho_scan_changes({"modules": ["Leads"]}, {})
+    refs = [c["change_ref"] for c in out["changes"]]
+    assert len(set(refs)) == 2, refs
+
+
+def t_scan_changes_honours_the_seen_set():
+    h = _change_helpers(rows_by_module={"Leads": [
+        {"id": "1", "Modified_Time": "2026-08-08T16:44:05+05:30"},
+        {"id": "2", "Modified_Time": "2026-08-08T17:10:00+05:30"}]})
+    m = load(h)
+    out, _ = m.zoho_scan_changes(
+        {"modules": ["Leads"],
+         "exclude_ids": ["Leads:1:2026-08-08T11:14:05Z"]}, {})
+    assert out["skipped_already_delivered"] == 1, out
+    assert out["count"] == 1, out
+
+
+def t_scan_changes_surfaces_an_unreadable_timestamp():
+    """A row we cannot prove is old must not silently become a row we skip."""
+    h = _change_helpers(rows_by_module={"Leads": [
+        {"id": "1", "Modified_Time": "sometime last tuesday"}]})
+    m = load(h)
+    out, _ = m.zoho_scan_changes({"modules": ["Leads"]}, {})
+    assert out["count"] == 1, out
+    assert out["changes"][0]["governed"] is False, out
+
+
+def t_scan_changes_counts_unmatchable_ledger_entries():
+    """Pre-upgrade entries and merges carry no Modified_Time. They are real
+    approvals, so they are counted rather than treated as evidence."""
+    ledger = {"chain_start": "0", "entries": [
+        {"outcome": "applied", "module": "Leads", "at": "2026-08-01T00:00:00Z",
+         "detail": {"records": 3}},
+        {"outcome": "applied", "module": "Leads", "at": "2026-08-02T00:00:00Z",
+         "detail": {"irreversible": True}},
+        {"outcome": "refused", "module": "Leads", "at": "2026-08-03T00:00:00Z",
+         "detail": {}}]}
+    m = load(_change_helpers(ledger=ledger))
+    out, _ = m.zoho_scan_changes({"modules": ["Leads"]}, {})
+    assert out["unmatchable_ledger_entries"] == 2, out
+    assert out["ledger_covers_from"] == "2026-08-01T00:00:00Z", out
+
+
+def t_scan_changes_refuses_an_unreadable_since():
+    """The station injects this; scanning from the beginning of time would
+    look like success while spending the day's API budget."""
+    m = load(_change_helpers())
+    try:
+        m.zoho_scan_changes({"modules": ["Leads"], "since": "yesterday"}, {})
+        assert False, "expected a refusal"
+    except RuntimeError as e:
+        assert "yesterday" in str(e), e
+
+
+def t_scan_changes_records_go_to_the_file_not_the_receipt():
+    """redact_output scrubs ids out of a receipt, so detail has to be a path."""
+    saved = {}
+    h = _change_helpers(rows_by_module={"Leads": [
+        {"id": "1", "Modified_Time": "2026-08-08T16:44:05+05:30",
+         "Modified_By": {"name": "Indra S", "id": "u1"}}]}, saved=saved)
+    m = load(h)
+    out, _ = m.zoho_scan_changes({"modules": ["Leads"]}, {})
+    assert "ungoverned" not in out, "records must not travel through a receipt"
+    report = saved[out["report_path"]]
+    assert report["ungoverned"][0]["id"] == "1", report
+    assert report["ungoverned"][0]["modified_by"] == "Indra S", report
+
+
+def t_scan_changes_truncates_rather_than_stepping_over_rows():
+    """Hitting the cap with more waiting must set truncated, or the station
+    advances its watermark past rows that were never returned."""
+    pages = [{"data": [{"id": str(i),
+                        "Modified_Time": "2026-08-08T16:44:05+05:30"}
+                       for i in range(200)], "info": {"more_records": True}}]
+    m = load(_change_helpers(pages=pages))
+    out, _ = m.zoho_scan_changes({"modules": ["Leads"], "limit": 200}, {})
+    assert out["truncated"] is True, out
+    assert out["count"] == 200, out["count"]
+
+
+def t_scan_changes_orders_ascending():
+    """ASC is mandatory: the cap truncates, and the station advances to the
+    newest row returned. Any other order strands older rows behind the mark."""
+    seen = {}
+
+    def _post(url, obj, **k):
+        seen["q"] = (obj or {}).get("select_query", "")
+        return 200, json.dumps({"data": []}).encode()
+
+    h = _change_helpers()
+    h["http_post_json"] = _post
+    m = load(h)
+    m.zoho_scan_changes({"modules": ["Leads"]}, {})
+    assert "order by Modified_Time asc" in seen["q"], seen["q"]
+
 for name, fn in sorted((k, v) for k, v in list(globals().items())
                        if k.startswith("t_")):
     check(name[2:], fn)
