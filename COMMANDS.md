@@ -1,6 +1,6 @@
 # shweta/zoho-crm - command reference
 
-Twenty-eight commands. Sixteen reads, which run without approval. Twelve
+Twenty-nine commands. Seventeen reads, which run without approval. Twelve
 writes, which stop at the airlock until a human approves the exact payload.
 
 Examples below use Zoho's own demo records, so you can follow along in a fresh
@@ -627,6 +627,101 @@ a list of zeroes buries the findings that matter.
 
 **Errors.** Raises if `stale_days` is below 1. Note that `0` is rejected
 rather than treated as absent.
+
+## zoho.scan_changes
+
+Reports records changed since the last run, and which of those nobody governed.
+Read-only, changes nothing.
+
+This exists to narrow the ledger's largest stated limit. The ledger sees only
+what this module wrote, so an edit made in the Zoho UI is invisible to it.
+`Modified_Time` is not, so a scan can name changes that never passed through an
+approval.
+
+A change counts as governed when this module recorded the exact post-write
+`Modified_Time` Zoho returned for it. Zoho sends that value on every SUCCESS row
+and it is byte-identical to a later read, so the match is exact rather than a
+tolerance window - an edit landing one second after an approved write is still
+reported instead of hiding behind it.
+
+Designed for the station's incremental scheduler. The station holds the
+position and injects `since`; the module stores no watermark of its own, so it
+cannot silently skip a window with nothing in a receipt to show for it. The
+command still runs by hand, in which case it scans everything.
+
+| input | type | required | notes |
+|---|---|---|---|
+| `modules` | array | no | Zoho API names to scan, default Leads, Contacts, Accounts, Deals |
+| `limit` | number | no | a safety cap per module, default 500 - not a selector |
+| `since` | string | no | ISO-8601 UTC, injected by the scheduler |
+| `exclude_ids` | array | no | change refs already delivered, injected by the scheduler |
+
+```json
+{ "modules": ["Leads", "Deals"] }
+```
+
+```json
+{
+  "ok": true,
+  "count": 44,
+  "since": null,
+  "rows_scanned": 44,
+  "skipped_already_delivered": 0,
+  "ungoverned_count": 44,
+  "truncated": false,
+  "report_path": "/home/you/.railcall/station/.railcall_workspace/scan_changes.20260808T182136Z.json",
+  "ledger_covers_from": "2026-08-01T07:02:19Z",
+  "unmatchable_ledger_entries": 6,
+  "summary": "44 changes since the start of the scan window. 44 have no matching ledger entry."
+}
+```
+
+**The records are in the file, not the response.** `redact_output` scrubs
+identifiers before sealing a receipt, so a record id comes back `[account]` and
+the finding stops being actionable. Counts stay inline; the file holds each
+ungoverned change with its id, `modified_at`, the raw offset Zoho sent, and
+`modified_by`.
+
+**The cursor identifies a change, not a record.** `change_ref` is
+`{module}:{id}:{modified_at}`, so a record edited twice is two items. Keying on
+the record id alone would have the scheduler suppress the second edit as
+already delivered - which in an active org is the common case, not an edge.
+
+**Ordering is ascending and mandatory.** The cap truncates and the station
+advances its watermark to the newest row returned; in any other order a
+truncated page strands older rows behind the mark and they are never seen again.
+Hitting the cap sets `truncated: true`, and the station then refuses to advance
+rather than stepping over work that was never returned.
+
+**Timestamps are normalised in the module.** Zoho renders an explicit offset
+(`2026-08-07T21:33:58+05:30`); the watermark is ISO-8601 UTC. Stripping the
+offset rather than converting it would make every record look 5.5 hours newer,
+drag the mark into the future, and permanently drop everything modified in that
+window. An unreadable timestamp surfaces the row rather than skipping it: a row
+that cannot be proved old must never silently become a row that is ignored.
+
+**Limits, all of them.**
+
+This finds ungoverned *edits*. A record deleted in the UI leaves nothing to
+poll, and a UI merge makes the loser invisible to COQL.
+
+Coverage starts at `ledger_covers_from`, the earliest entry in the live ledger
+chain. The chain rotates past 5000 entries into sealed archives, which this does
+not read.
+
+`unmatchable_ledger_entries` counts applied entries with no recorded
+`Modified_Time`: everything written before the ledger began recording it, plus
+every merge, since Zoho's merge response carries no timestamp for the master.
+Those are real approvals this cannot match, so the count is reported rather than
+their records being quietly called ungoverned.
+
+`modified_by` is Zoho's record of who last touched the record. For writes this
+module made it is always the OAuth user, so it names a person only for changes
+the module did not make.
+
+**Errors.** Raises if `modules` is not a list, or if `since` is not a readable
+ISO-8601 timestamp - scanning from the beginning of time on a bad value would
+look like success while spending the day's API budget.
 
 ## zoho.check_readiness
 
