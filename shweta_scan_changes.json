@@ -1,0 +1,61 @@
+{
+  "id": "shweta/scan-changes",
+  "name": "shweta_scan_changes",
+  "title": "Find changes nobody governed",
+  "version": "0.1.0",
+  "kind": "canvas",
+  "status": "CANVAS",
+  "author": "shweta",
+  "tag": "governed CRM",
+  "desc": "A change ledger can only record what it was told about. Every write this module makes is hash-chained into one, but a person editing a record directly in the Zoho UI leaves no entry - so the ledger's own honest limit has always been that it covers changes made through the module and nothing else.\n\nModified_Time does not have that limit. This workflow runs zoho.scan_changes on a schedule, reads what actually moved across Leads, Contacts, Accounts and Deals, and matches each change against the ledger. A change is governed when the module recorded the exact post-write Modified_Time Zoho returned for it. The match is exact rather than a tolerance window, so an edit landing one second after an approved write is still reported rather than hidden behind it.\n\nThe station holds the scan position, not the module. A module that stores its own watermark can skip a window after an update with nothing in a receipt to show for it.\n\nHonest about limits. This finds ungoverned EDITS: a record deleted in the UI leaves nothing to poll, and a UI merge makes the loser invisible to the query. Coverage starts at the earliest entry in the live ledger chain, because the chain rotates and sealed archives are not read here. Entries written before the ledger recorded Modified_Time, and every merge, cannot be matched at all - the count of those is reported rather than letting their records be called ungoverned. Modified_By is Zoho's record of who last touched a record, which for the module's own writes is always the OAuth user, so it names a person only for changes the module did not make.\n\nRead-only. Nothing is written to Zoho and nothing is sent anywhere. Record ids are scrubbed from receipts, so the changes themselves go to a report file and the receipt carries the counts and the path.",
+  "trigger": "manual",
+  "capabilities": {
+    "max_spend_cents": 0
+  },
+  "steps": [
+    {
+      "id": "scan",
+      "label": "Report what changed, and what nobody approved",
+      "command_id": "shweta/zoho-crm.scan_changes",
+      "inputs_template": {}
+    }
+  ],
+  "nodes": [
+    {
+      "id": "scan",
+      "label": "Report what changed, and what nobody approved",
+      "command_id": "shweta/zoho-crm.scan_changes"
+    }
+  ],
+  "edges": [],
+  "canvas_spec": {
+    "nodes": [
+      {
+        "id": "scan",
+        "type": "effect",
+        "x": 80,
+        "y": 120,
+        "action_id": "zoho_scan_changes",
+        "action_title": "Report what changed since the last run, and which changes have no approval behind them",
+        "provider": "zoho",
+        "args": {}
+      }
+    ],
+    "edges": []
+  },
+  "engine_spec": {
+    "id": "shweta_scan_changes",
+    "title": "Find changes nobody governed",
+    "context": {},
+    "nodes": [
+      {
+        "id": "scan",
+        "type": "effect",
+        "branch": "review",
+        "action_id": "zoho_scan_changes",
+        "provider": "zoho",
+        "args": {}
+      }
+    ]
+  }
+}
