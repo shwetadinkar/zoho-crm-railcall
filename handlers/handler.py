@@ -320,6 +320,15 @@ def _summarise(response, action, stamp):
         "succeeded": len(ok),
         "failed": len(bad),
         "ids": [r.get("details", {}).get("id") for r in ok],
+        # Zoho returns the post-write Modified_Time on every SUCCESS row, and
+        # it is byte-identical to what a follow-up read reports (verified
+        # live). Recording it lets a later scan match a change to this ledger
+        # entry EXACTLY, instead of guessing with a tolerance window around
+        # the module's own clock. Without it, a UI edit landing seconds after
+        # a module write is indistinguishable from the write itself.
+        "written": [{"id": r.get("details", {}).get("id"),
+                     "modified_time": r.get("details", {}).get("Modified_Time")}
+                    for r in ok],
         "errors": [{"code": r.get("code"),
                     "message": r.get("message"),
                     "field": r.get("details", {}).get("api_name")} for r in bad],
@@ -620,13 +629,19 @@ def _strip_limit(query):
                   flags=re.I)
 
 
-def _coql_all(base_query, cap=_SCAN_CAP, label="query"):
-    """Run a SELECT to completion instead of taking the first page.
+def _coql_capped(base_query, cap=_SCAN_CAP, label="query"):
+    """Page a SELECT up to `cap` rows and report whether more were waiting.
 
-    Zoho returns at most 200 rows per call and flags more_records. Reading one
-    page and calling it the answer is how a handover reports 200 records,
-    moves 200, and quietly leaves the other 140 behind. Anything that claims a
-    set is complete has to page.
+    Returns (rows, hit_cap). `hit_cap` is True only when the ceiling was
+    reached AND Zoho still flagged more_records -- a result that lands
+    exactly on the cap with nothing behind it is complete, not truncated.
+    Getting that wrong on a scheduled read means reporting truncation
+    forever and never advancing a watermark.
+
+    This is the resumable-stream variant. It stops cleanly and leaves the
+    caller to come back for the rest, which is only safe when something
+    downstream tracks position. If a human is about to act on the result,
+    use _coql_all instead -- see its docstring for why the two differ.
 
     `base_query` must have no LIMIT of its own; this appends one.
     """
@@ -636,14 +651,34 @@ def _coql_all(base_query, cap=_SCAN_CAP, label="query"):
         response = _call("POST", "coql", body={"select_query": page_q})
         page = response.get("data") or []
         rows.extend(page)
-        if len(rows) > cap:
-            raise RuntimeError(
-                "%s matches more than %d records. Narrow it rather than acting "
-                "on a partial set; a half-complete result here is worse than an "
-                "error." % (label, cap))
-        if not (response.get("info") or {}).get("more_records"):
-            return rows
+        more = bool((response.get("info") or {}).get("more_records"))
+        if len(rows) >= cap:
+            return rows[:cap], (more or len(rows) > cap)
+        if not more:
+            return rows, False
         offset += _COQL_PAGE
+
+
+def _coql_all(base_query, cap=_SCAN_CAP, label="query"):
+    """Run a SELECT to completion instead of taking the first page.
+    Zoho returns at most 200 rows per call and flags more_records. Reading one
+    page and calling it the answer is how a handover reports 200 records,
+    moves 200, and quietly leaves the other 140 behind. Anything that claims a
+    set is complete has to page.
+
+    Raises rather than truncating: a caller here is about to act on the set,
+    and a half-complete answer is worse than an error. The resumable variant
+    is _coql_capped, which is only correct when something tracks position.
+
+    `base_query` must have no LIMIT of its own; this appends one.
+    """
+    rows, hit_cap = _coql_capped(base_query, cap, label)
+    if hit_cap:
+        raise RuntimeError(
+            "%s matches more than %d records. Narrow it rather than acting "
+            "on a partial set; a half-complete result here is worse than an "
+            "error." % (label, cap))
+    return rows
 
 
 def _read_by_ids(module, ids, fields):
@@ -802,6 +837,7 @@ def zoho_apply_update(inputs, stamp):
         _plan_key(module, query, changes),
         {"records": len(payload), "fields": fields, "fingerprint": expected,
          "changes": changes,
+         "written": result.get("written"),
          "before": [{"id": r["id"],
                      "before": {f: r["before"].get(f) for f in fields}}
                     for r in snapshot]}))
@@ -1562,6 +1598,10 @@ def zoho_apply_upsert(inputs, stamp):
             % (len(ids), actual[:23] + "...", expected[:23] + "..."))
 
     succeeded, failed, errors = 0, 0, []
+    # Zoho's post-write Modified_Time, per record, exactly as returned. A later
+    # scan matches a change to this entry on it, so the match is exact instead
+    # of a guess against the module's own clock.
+    written = []
     for start in range(0, len(records), _UPSERT_CALL):
         batch = records[start:start + _UPSERT_CALL]
         body = {"data": batch, "duplicate_check_fields": fields}
@@ -1569,6 +1609,9 @@ def zoho_apply_upsert(inputs, stamp):
         for row in (response.get("data") or []):
             if (row or {}).get("code") == "SUCCESS":
                 succeeded += 1
+                _d = (row or {}).get("details") or {}
+                written.append({"id": _d.get("id"),
+                                "modified_time": _d.get("Modified_Time")})
             else:
                 failed += 1
                 if len(errors) < 20:
@@ -1578,6 +1621,7 @@ def zoho_apply_upsert(inputs, stamp):
         "applied", "apply_upsert", module, key,
         {"records": len(records), "fields": fields, "fingerprint": expected,
          "updated": stored.get("updates"), "created": stored.get("creates"),
+         "written": written,
          "succeeded": succeeded, "failed": failed}))
 
     _done_calls = (len(records) + _UPSERT_CALL - 1) // _UPSERT_CALL
@@ -2533,6 +2577,7 @@ def zoho_apply_rollback(inputs, stamp):
         "applied", "apply_rollback", module, key,
         {"records": len(payload), "fields": fields,
          "fingerprint": expected,
+         "written": result.get("written"),
          "before": [{"id": r["id"],
                      "before": {f: (now_by_id.get(r["id"], {}) or {}).get(f)
                                 for f in fields}} for r in payload]}))
