@@ -1,18 +1,22 @@
 {
-  "id": "shweta/governed-handover",
-  "name": "shweta_governed_handover",
+  "id": "shweta_governed_handover",
   "title": "Governed handover when someone leaves",
-  "version": "1.0.1",
   "kind": "canvas",
   "status": "CANVAS",
   "author": "shweta",
   "tag": "governed CRM",
-  "desc": "Somebody leaves the company. This workflow reports everything they own across Leads, Deals, Contacts and Accounts, reassigns the whole book in one governed batch, and confirms the change is recorded in a tamper-evident ledger.\n\nThe point is the middle step. plan_handover fingerprints the exact set of records it is about to move. apply_handover re-reads that set, re-hashes it, and REFUSES if anything moved in between - so a record edited between review and execution stops the write rather than being silently swept up in it. A CRM has no undo, and this is the gap ordinary automation leaves open.\n\nEvery step produces a signed receipt, and the run carries an integrity root over all three nodes. The final step verifies the local change ledger, which is hash-chained: each entry carries the fingerprint of the one before it, so editing or removing an entry breaks every link after it.\n\nLive execution is OFF by default. Dry-run works anywhere; firing this workflow for real requires an operator to enable Studio DAG live runs under Studio -> Settings -> Live Execution. That toggle is the human gate on this path, and the setting is signed on save.\n\nHonest about limits: the ledger is tamper-EVIDENT, not tamper-proof, and it records changes made through this module only. Somebody editing directly in the Zoho UI is invisible to it. Closed deals are excluded from a handover unless you ask for them.\n\nVerified end to end against a live Zoho org on station v0.59 - 42 records moved and moved back, three nodes, COMPLETED both directions.\n\nTrigger contract: supply from_user and to_user as email addresses of Zoho CRM users.\n\nDependencies: requires shweta/zoho-crm v0.6.2 or later, with the zoho vault entry configured (client_id, client_secret, refresh_token, token_url, instance_url). Run zoho.verify_connection first - it names any missing scope and which commands it blocks. [contest:2026Q3]",
+  "desc": "Somebody leaves the company. This workflow finds the changes nobody approved, reports everything the departing user owns across Leads, Deals, Contacts and Accounts, reassigns the whole book in one governed batch, and confirms the change is recorded in a tamper-evident ledger.\n\nIt opens with scan_changes because the ledger has an honest limit: it records changes made through this module only, so somebody editing directly in the Zoho UI is invisible to it. Modified_Time is not. The first step reads what actually moved and matches each change against the ledger on the exact post-write timestamp Zoho returned, naming the ones with no approval behind them. That is how you find out the leaver's records have been edited by hand before you move them - and the count is what makes the handover worth running now rather than later.\n\nThe point is still the middle. plan_handover fingerprints the exact set of records it is about to move. apply_handover re-reads that set, re-hashes it, and REFUSES if anything moved in between - so a record edited between review and execution stops the write rather than being silently swept up in it. A CRM has no undo, and this is the gap ordinary automation leaves open.\n\nEvery step produces a signed receipt, and the run carries an integrity root over all four nodes. The final step verifies the local change ledger, which is hash-chained: each entry carries the fingerprint of the one before it, so editing or removing an entry breaks every link after it.\n\nLive execution is OFF by default. Dry-run works anywhere; firing this workflow for real requires an operator to enable Studio DAG live runs under Studio -> Settings -> Live Execution. That toggle is the human gate on this path, and the setting is signed on save.\n\nHonest about limits: the ledger is tamper-EVIDENT, not tamper-proof. scan_changes narrows the UI-edit gap but does not close it - it finds ungoverned EDITS, and a record deleted or merged in the UI leaves nothing to poll. Its record ids go to a file, because receipts redact identifiers. Closed deals are excluded from a handover unless you ask for them.\n\nVerified end to end against a live Zoho org - 42 records moved and moved back, COMPLETED both directions, and the scan step verified on station v0.64 including the truncation case, where the station correctly refuses to advance its cursor past rows the module did not return.\n\nTrigger contract: supply from_user and to_user as email addresses of Zoho CRM users.\n\nDependencies: requires shweta/zoho-crm v0.8.0 or later, with the zoho vault entry configured (client_id, client_secret, refresh_token, token_url, instance_url). Run zoho.verify_connection first - it names any missing scope and which commands it blocks. [contest:2026Q3]",
   "trigger": "manual",
   "capabilities": {
     "max_spend_cents": 0
   },
   "steps": [
+    {
+      "id": "scan",
+      "label": "Find the changes nobody approved",
+      "command_id": "shweta/zoho-crm.scan_changes",
+      "inputs_template": {}
+    },
     {
       "id": "plan",
       "label": "Count everything one user owns",
@@ -40,6 +44,11 @@
   ],
   "nodes": [
     {
+      "id": "scan",
+      "label": "Find the changes nobody approved",
+      "command_id": "shweta/zoho-crm.scan_changes"
+    },
+    {
       "id": "plan",
       "label": "Count everything one user owns",
       "command_id": "shweta/zoho-crm.plan_handover"
@@ -57,6 +66,10 @@
   ],
   "edges": [
     {
+      "from": "scan",
+      "to": "plan"
+    },
+    {
       "from": "plan",
       "to": "apply"
     },
@@ -68,9 +81,19 @@
   "canvas_spec": {
     "nodes": [
       {
-        "id": "plan",
+        "id": "scan",
         "type": "effect",
         "x": 80,
+        "y": 120,
+        "action_id": "zoho_scan_changes",
+        "action_title": "Report what changed since the last run, and which changes nobody approved",
+        "provider": "zoho",
+        "args": {}
+      },
+      {
+        "id": "plan",
+        "type": "effect",
+        "x": 420,
         "y": 120,
         "action_id": "zoho_plan_handover",
         "action_title": "Count everything one user owns, before moving any of it",
@@ -83,7 +106,7 @@
       {
         "id": "apply",
         "type": "effect",
-        "x": 420,
+        "x": 760,
         "y": 120,
         "action_id": "zoho_apply_handover",
         "action_title": "Reassign the planned set, refusing if anything has moved since",
@@ -96,7 +119,7 @@
       {
         "id": "verify",
         "type": "effect",
-        "x": 760,
+        "x": 1100,
         "y": 120,
         "action_id": "zoho_verify_ledger",
         "action_title": "Check the local change ledger has not been altered",
@@ -105,6 +128,10 @@
       }
     ],
     "edges": [
+      {
+        "from": "scan",
+        "to": "plan"
+      },
       {
         "from": "plan",
         "to": "apply"
@@ -124,9 +151,18 @@
     },
     "nodes": [
       {
+        "id": "scan",
+        "type": "effect",
+        "branch": "review",
+        "action_id": "zoho_scan_changes",
+        "provider": "zoho",
+        "args": {}
+      },
+      {
         "id": "plan",
         "type": "effect",
         "branch": "review",
+        "parent": "scan",
         "action_id": "zoho_plan_handover",
         "provider": "zoho",
         "args": {
