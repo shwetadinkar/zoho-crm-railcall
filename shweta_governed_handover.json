@@ -1,5 +1,5 @@
 {
-  "id": "shweta_governed_handover",
+  "id": "shweta/governed-handover",
   "title": "Governed handover when someone leaves",
   "kind": "canvas",
   "status": "CANVAS",
@@ -192,5 +192,6 @@
         "args": {}
       }
     ]
-  }
+  },
+  "version": "1.1.0"
 }
