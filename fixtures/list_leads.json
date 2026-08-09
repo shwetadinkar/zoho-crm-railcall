@@ -1,0 +1,36 @@
+{
+  "body": {
+    "data": [
+      {
+        "Last_Name": "Maclead",
+        "Owner": {
+          "email": "redacted@example.com",
+          "id": "id_1",
+          "name": "REDACTED"
+        },
+        "id": "id_2"
+      },
+      {
+        "Last_Name": "Kidman (Sample)",
+        "Owner": {
+          "email": "redacted@example.com",
+          "id": "id_1",
+          "name": "REDACTED"
+        },
+        "id": "id_3"
+      }
+    ],
+    "info": {
+      "count": 2,
+      "more_records": true,
+      "next_page_token": "token_1",
+      "page": 1,
+      "page_token_expiry": "2026-08-10T13:44:26+05:30",
+      "per_page": 2,
+      "previous_page_token": null,
+      "sort_by": "id",
+      "sort_order": "desc"
+    }
+  },
+  "status": 200
+}

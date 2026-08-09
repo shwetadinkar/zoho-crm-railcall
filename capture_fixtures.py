@@ -27,11 +27,17 @@ VAULT = os.path.expanduser("~/.railcall/station/.railcall_workspace/keys.local.j
 OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
 
 # Anything matching these key names gets replaced before the fixture is saved.
-# Fixtures live in a public repo; org identifiers and addresses do not belong
-# in one.
+# Fixtures live in a public repo; org identifiers, addresses and person names
+# do not belong in one. This machine's user must never appear in output that
+# ships publicly, so first_name/last_name/full_name/name are scrubbed
+# unconditionally rather than only where a name happens to say "Indra" -
+# leaves profile/role labels like "Administrator" also redacted, which is an
+# acceptable shape loss against the alternative of a name check that could
+# miss a spelling.
 SCRUB_KEYS = {"email", "primary_email", "Email", "Secondary_Email", "phone",
               "Phone", "Mobile", "company_name", "Website", "zgid", "zuid",
-              "mc_status", "Owner_Email"}
+              "mc_status", "Owner_Email", "name", "first_name", "last_name",
+              "full_name", "domain_name", "primary_zuid", "next_page_token"}
 
 
 def _token(v):
@@ -42,20 +48,39 @@ def _token(v):
     return json.loads(r.read())["access_token"]
 
 
-def _scrub(node, depth=0):
-    """Replace identifying values, keep the shape."""
+def _scrub(node, id_map=None):
+    """Replace identifying values, keep the shape.
+
+    Real record ids get a stable placeholder per unique value (id_1, id_2,
+    ...) rather than one placeholder per nesting depth - callers like
+    _summarise and scan_changes pair ids with other per-record fields
+    (Modified_Time, cursor keys), so two different records collapsing to the
+    same fake id would make the fixture useless for exactly the code it's
+    meant to pin down.
+    """
+    if id_map is None:
+        id_map = {}
     if isinstance(node, dict):
         out = {}
         for k, val in node.items():
             if k in SCRUB_KEYS and isinstance(val, str):
-                out[k] = "redacted@example.com" if "mail" in k.lower() else "REDACTED"
+                if "mail" in k.lower():
+                    out[k] = "redacted@example.com"
+                elif k == "next_page_token":
+                    # A live pagination cursor from a real query - opaque,
+                    # unverifiable, and no test needs the actual bytes.
+                    out[k] = "token_1"
+                else:
+                    out[k] = "REDACTED"
             elif k == "id" and isinstance(val, str) and val.isdigit():
-                out[k] = "1" + "0" * (len(val) - 2) + str(depth)
+                if val not in id_map:
+                    id_map[val] = "id_%d" % (len(id_map) + 1)
+                out[k] = id_map[val]
             else:
-                out[k] = _scrub(val, depth + 1)
+                out[k] = _scrub(val, id_map)
         return out
     if isinstance(node, list):
-        return [_scrub(x, depth + 1) for x in node[:3]]
+        return [_scrub(x, id_map) for x in node[:3]]
     return node
 
 
@@ -67,22 +92,29 @@ def main():
     tok = _token(v)
     H = {"Authorization": "Zoho-oauthtoken " + tok, "Content-Type": "application/json"}
 
+    def _body_json(raw):
+        # A 204 (e.g. GET on a deleted/bad record id) and some error
+        # responses come back with an empty or whitespace-only body, which
+        # json.loads rejects outright rather than treating as "no body".
+        text = raw.decode()
+        return json.loads(text) if text.strip() else {}
+
     def get(path):
         try:
             r = urllib.request.urlopen(
                 urllib.request.Request(v["instance_url"] + path, headers=H), timeout=30)
-            return r.status, json.loads(r.read())
+            return r.status, _body_json(r.read())
         except urllib.error.HTTPError as e:
-            return e.code, json.loads(e.read().decode() or "{}")
+            return e.code, _body_json(e.read())
 
     def coql(q):
         try:
             r = urllib.request.urlopen(urllib.request.Request(
                 v["instance_url"] + "/crm/v8/coql", method="POST",
                 data=json.dumps({"select_query": q}).encode(), headers=H), timeout=30)
-            return r.status, json.loads(r.read())
+            return r.status, _body_json(r.read())
         except urllib.error.HTTPError as e:
-            return e.code, json.loads(e.read().decode() or "{}")
+            return e.code, _body_json(e.read())
 
     cases = {
         "org":              lambda: get("/crm/v8/org"),

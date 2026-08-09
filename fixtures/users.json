@@ -1,0 +1,157 @@
+{
+  "body": {
+    "info": {
+      "count": 2,
+      "more_records": false,
+      "page": 1,
+      "per_page": 200
+    },
+    "users": [
+      {
+        "$current_shift": null,
+        "$next_shift": null,
+        "$shift_effective_from": null,
+        "Isonline": false,
+        "Modified_By": {
+          "id": "id_1",
+          "name": "REDACTED"
+        },
+        "Modified_Time": "2026-07-29T18:43:28+05:30",
+        "Preferred_Currency__s": null,
+        "alias": null,
+        "city": null,
+        "confirm": true,
+        "country": "India",
+        "country_locale": "en_IN",
+        "created_by": {
+          "id": "id_1",
+          "name": "REDACTED"
+        },
+        "created_time": "2026-07-27T23:22:43+05:30",
+        "customize_info": {
+          "bc_view": null,
+          "notes_desc": null,
+          "show_detail_view": true,
+          "show_home": false,
+          "show_left_panel": true,
+          "show_right_panel": null,
+          "unpin_recent_item": null
+        },
+        "date_format": "dd/MM/yyyy",
+        "decimal_separator": "Period",
+        "default_tab_group": "0",
+        "distance_preference__s": "Kilometers",
+        "dob": null,
+        "email": "redacted@example.com",
+        "fax": null,
+        "first_name": "REDACTED",
+        "full_name": "REDACTED",
+        "id": "id_1",
+        "language": "en_US",
+        "last_name": "REDACTED",
+        "locale": "en_US",
+        "microsoft": false,
+        "mobile": null,
+        "name_format__s": "Salutation,First Name,Last Name",
+        "number_separator": "Comma",
+        "offset": 19800000,
+        "personal_account": false,
+        "phone": null,
+        "profile": {
+          "id": "id_2",
+          "name": "REDACTED"
+        },
+        "role": {
+          "id": "id_3",
+          "name": "REDACTED"
+        },
+        "sandboxDeveloper": false,
+        "signature": null,
+        "sort_order_preference__s": "First Name,Last Name",
+        "state": "Delhi",
+        "status": "active",
+        "status_reason__s": null,
+        "street": null,
+        "theme": {
+          "background": "#F3F0EB",
+          "new_background": null,
+          "normal_tab": {
+            "background": "#222222",
+            "font_color": "#FFFFFF"
+          },
+          "screen": "fixed",
+          "selected_tab": {
+            "background": "#222222",
+            "font_color": "#FFFFFF"
+          },
+          "type": "default"
+        },
+        "time_format": "hh:mm a",
+        "time_zone": "Asia/Kolkata",
+        "type__s": "Regular User",
+        "website": null,
+        "zip": null,
+        "zuid": "REDACTED"
+      },
+      {
+        "$current_shift": null,
+        "$next_shift": null,
+        "$shift_effective_from": null,
+        "Isonline": false,
+        "Modified_By": {
+          "id": "id_1",
+          "name": "REDACTED"
+        },
+        "Modified_Time": "2026-07-29T18:42:25+05:30",
+        "Preferred_Currency__s": null,
+        "alias": null,
+        "city": null,
+        "confirm": true,
+        "country": null,
+        "country_locale": "en_IN",
+        "created_by": {
+          "id": "id_1",
+          "name": "REDACTED"
+        },
+        "created_time": "2026-07-29T05:04:49+05:30",
+        "date_format": "dd/MM/yyyy",
+        "decimal_separator": "Period",
+        "distance_preference__s": "Kilometers",
+        "dob": null,
+        "email": "redacted@example.com",
+        "fax": null,
+        "first_name": "REDACTED",
+        "full_name": "REDACTED",
+        "id": "id_5",
+        "language": "en_US",
+        "last_name": "REDACTED",
+        "locale": "en_US",
+        "microsoft": false,
+        "mobile": null,
+        "number_separator": "Comma",
+        "offset": 19800000,
+        "phone": null,
+        "profile": {
+          "id": "id_2",
+          "name": "REDACTED"
+        },
+        "role": {
+          "id": "id_4",
+          "name": "REDACTED"
+        },
+        "sandboxDeveloper": false,
+        "state": null,
+        "status": "active",
+        "status_reason__s": null,
+        "street": null,
+        "time_format": "hh:mm a",
+        "time_zone": "Asia/Kolkata",
+        "type__s": "Regular User",
+        "website": null,
+        "zip": null,
+        "zuid": "REDACTED"
+      }
+    ]
+  },
+  "status": 200
+}

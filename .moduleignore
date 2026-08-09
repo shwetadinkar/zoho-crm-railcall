@@ -10,3 +10,6 @@ apply_061.py
 shweta_governed_handover.json
 *.bak
 *.bak[0-9]
+HANDOFF.md
+HANDOFF_CODE.md
+fixtures/

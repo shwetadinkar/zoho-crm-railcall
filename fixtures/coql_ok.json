@@ -1,0 +1,19 @@
+{
+  "body": {
+    "data": [
+      {
+        "Last_Name": "Tjepkema (Sample)",
+        "id": "id_1"
+      },
+      {
+        "Last_Name": "Hirpara (Sample)",
+        "id": "id_2"
+      }
+    ],
+    "info": {
+      "count": 2,
+      "more_records": true
+    }
+  },
+  "status": 200
+}

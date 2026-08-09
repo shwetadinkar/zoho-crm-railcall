@@ -1,0 +1,56 @@
+{
+  "body": {
+    "org": [
+      {
+        "alias": null,
+        "city": null,
+        "company_name": "REDACTED",
+        "country": null,
+        "country_code": "IN",
+        "created_time": "2026-07-27T23:22:43+05:30",
+        "currency": "Indian Rupee - INR",
+        "currency_locale": "INR",
+        "currency_symbol": "Rs.",
+        "deletable_org_account": false,
+        "description": null,
+        "domain_name": "REDACTED",
+        "employee_count": "10",
+        "fax": null,
+        "gapps_enabled": false,
+        "hierarchy_preferences": {
+          "type": "Role_Hierarchy"
+        },
+        "hipaa_compliance_enabled": false,
+        "id": "id_1",
+        "iso_code": "INR",
+        "license_details": {
+          "paid": false,
+          "paid_expiry": null,
+          "paid_type": "free",
+          "portal_users_license_purchased": 0,
+          "trial_expiry": "2026-08-11T05:30:00+05:30",
+          "trial_type": "enterprise",
+          "users_license_purchased": 3
+        },
+        "lite_users_enabled": false,
+        "mc_status": false,
+        "mobile": null,
+        "phone": "REDACTED",
+        "photo_id": null,
+        "primary_email": "redacted@example.com",
+        "primary_zuid": "REDACTED",
+        "privacy_settings": false,
+        "state": null,
+        "street": null,
+        "time_zone": "Asia/Kolkata",
+        "translation_enabled": false,
+        "type": "production",
+        "website": null,
+        "zgid": "REDACTED",
+        "zia_portal_id": null,
+        "zip": null
+      }
+    ]
+  },
+  "status": 200
+}

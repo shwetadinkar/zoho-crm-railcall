@@ -1,0 +1,326 @@
+{
+  "body": {
+    "fields": [
+      {
+        "address": {
+          "type": "latitude"
+        },
+        "api_name": "Latitude",
+        "associated_module": null,
+        "association_details": null,
+        "auto_number": {},
+        "businesscard_supported": true,
+        "child_fields": null,
+        "colour_code_enabled_by_system": false,
+        "convert_mapping": {
+          "Accounts": "Billing_Latitude",
+          "Contacts": "Mailing_Latitude",
+          "Deals": null
+        },
+        "created_source": "default",
+        "created_time": null,
+        "crypt": null,
+        "currency": {},
+        "custom_field": false,
+        "customizable_properties": [
+          "mandatory"
+        ],
+        "data_type": "double",
+        "decimal_place": 9,
+        "display_field": false,
+        "display_format": null,
+        "display_format_properties": null,
+        "display_label": "Address - Latitude",
+        "display_type": -1,
+        "email_parser": {
+          "fields_update_supported": false,
+          "record_operations_supported": false
+        },
+        "enable_colour_code": false,
+        "enable_record_category": false,
+        "external": null,
+        "field_label": "Address - Latitude",
+        "field_read_only": false,
+        "filterable": false,
+        "formula": {},
+        "global_picklist": null,
+        "history_tracking": null,
+        "history_tracking_enabled": false,
+        "id": "id_1",
+        "json_type": "double",
+        "layout_associations": [
+          {
+            "api_name": "Standard__s",
+            "id": "id_5",
+            "name": "REDACTED"
+          }
+        ],
+        "length": 50,
+        "lookup": {},
+        "mass_update": false,
+        "modified_time": null,
+        "multi_module_lookup": {},
+        "multiselectlookup": {},
+        "operation_type": {
+          "api_create": true,
+          "api_update": true,
+          "web_create": true,
+          "web_update": true
+        },
+        "parent_field": {
+          "api_name": "Coordinates",
+          "id": "id_4",
+          "name": "REDACTED"
+        },
+        "pick_list_values": [],
+        "pick_list_values_sorted_lexically": false,
+        "profiles": [
+          {
+            "id": "id_2",
+            "name": "REDACTED",
+            "permission_type": "read_write"
+          },
+          {
+            "id": "id_3",
+            "name": "REDACTED",
+            "permission_type": "read_write"
+          }
+        ],
+        "public": false,
+        "range": null,
+        "read_only": false,
+        "rollup_summary": {},
+        "searchable": true,
+        "separator": false,
+        "sortable": true,
+        "static_field": false,
+        "system_mandatory": false,
+        "tooltip": null,
+        "type": "used",
+        "ui_type": 38,
+        "unique": {},
+        "view_type": {
+          "create": true,
+          "edit": true,
+          "quick_create": false,
+          "view": true
+        },
+        "virtual_field": false,
+        "visible": true,
+        "webhook": true
+      },
+      {
+        "address": {
+          "type": "longitude"
+        },
+        "api_name": "Longitude",
+        "associated_module": null,
+        "association_details": null,
+        "auto_number": {},
+        "businesscard_supported": true,
+        "child_fields": null,
+        "colour_code_enabled_by_system": false,
+        "convert_mapping": {
+          "Accounts": "Billing_Longitude",
+          "Contacts": "Mailing_Longitude",
+          "Deals": null
+        },
+        "created_source": "default",
+        "created_time": null,
+        "crypt": null,
+        "currency": {},
+        "custom_field": false,
+        "customizable_properties": [
+          "mandatory"
+        ],
+        "data_type": "double",
+        "decimal_place": 9,
+        "display_field": false,
+        "display_format": null,
+        "display_format_properties": null,
+        "display_label": "Address - Longitude",
+        "display_type": -1,
+        "email_parser": {
+          "fields_update_supported": false,
+          "record_operations_supported": false
+        },
+        "enable_colour_code": false,
+        "enable_record_category": false,
+        "external": null,
+        "field_label": "Address - Longitude",
+        "field_read_only": false,
+        "filterable": false,
+        "formula": {},
+        "global_picklist": null,
+        "history_tracking": null,
+        "history_tracking_enabled": false,
+        "id": "id_6",
+        "json_type": "double",
+        "layout_associations": [
+          {
+            "api_name": "Standard__s",
+            "id": "id_5",
+            "name": "REDACTED"
+          }
+        ],
+        "length": 50,
+        "lookup": {},
+        "mass_update": false,
+        "modified_time": null,
+        "multi_module_lookup": {},
+        "multiselectlookup": {},
+        "operation_type": {
+          "api_create": true,
+          "api_update": true,
+          "web_create": true,
+          "web_update": true
+        },
+        "parent_field": {
+          "api_name": "Coordinates",
+          "id": "id_4",
+          "name": "REDACTED"
+        },
+        "pick_list_values": [],
+        "pick_list_values_sorted_lexically": false,
+        "profiles": [
+          {
+            "id": "id_2",
+            "name": "REDACTED",
+            "permission_type": "read_write"
+          },
+          {
+            "id": "id_3",
+            "name": "REDACTED",
+            "permission_type": "read_write"
+          }
+        ],
+        "public": false,
+        "range": null,
+        "read_only": false,
+        "rollup_summary": {},
+        "searchable": true,
+        "separator": false,
+        "sortable": true,
+        "static_field": false,
+        "system_mandatory": false,
+        "tooltip": null,
+        "type": "used",
+        "ui_type": 38,
+        "unique": {},
+        "view_type": {
+          "create": true,
+          "edit": true,
+          "quick_create": false,
+          "view": true
+        },
+        "virtual_field": false,
+        "visible": true,
+        "webhook": true
+      },
+      {
+        "address": null,
+        "api_name": "Owner",
+        "associated_module": null,
+        "association_details": null,
+        "auto_number": {},
+        "businesscard_supported": true,
+        "child_fields": null,
+        "colour_code_enabled_by_system": false,
+        "convert_mapping": {
+          "Accounts": null,
+          "Contacts": null,
+          "Deals": null
+        },
+        "created_source": "default",
+        "created_time": null,
+        "crypt": null,
+        "currency": {},
+        "custom_field": false,
+        "customizable_properties": [
+          "fieldlabel",
+          "field_of_lookup"
+        ],
+        "data_type": "ownerlookup",
+        "decimal_place": null,
+        "display_field": false,
+        "display_format": null,
+        "display_format_properties": null,
+        "display_label": "Lead Owner",
+        "display_type": -1,
+        "email_parser": {
+          "fields_update_supported": false,
+          "record_operations_supported": false
+        },
+        "enable_colour_code": false,
+        "enable_record_category": false,
+        "external": null,
+        "field_label": "Lead Owner",
+        "field_read_only": true,
+        "filterable": true,
+        "formula": {},
+        "global_picklist": null,
+        "history_tracking": null,
+        "history_tracking_enabled": false,
+        "id": "id_7",
+        "json_type": "jsonobject",
+        "layout_associations": [
+          {
+            "api_name": "Standard__s",
+            "id": "id_5",
+            "name": "REDACTED"
+          }
+        ],
+        "length": 120,
+        "lookup": {},
+        "mass_update": false,
+        "modified_time": null,
+        "multi_module_lookup": {},
+        "multiselectlookup": {},
+        "operation_type": {
+          "api_create": true,
+          "api_update": true,
+          "web_create": true,
+          "web_update": true
+        },
+        "parent_field": null,
+        "pick_list_values": [],
+        "pick_list_values_sorted_lexically": false,
+        "profiles": [
+          {
+            "id": "id_2",
+            "name": "REDACTED",
+            "permission_type": "read_write"
+          },
+          {
+            "id": "id_3",
+            "name": "REDACTED",
+            "permission_type": "read_write"
+          }
+        ],
+        "public": false,
+        "range": null,
+        "read_only": false,
+        "rollup_summary": {},
+        "searchable": true,
+        "separator": false,
+        "sortable": true,
+        "static_field": false,
+        "system_mandatory": false,
+        "tooltip": null,
+        "type": "used",
+        "ui_type": 8,
+        "unique": {},
+        "view_type": {
+          "create": true,
+          "edit": true,
+          "quick_create": false,
+          "view": true
+        },
+        "virtual_field": false,
+        "visible": true,
+        "webhook": true
+      }
+    ]
+  },
+  "status": 200
+}
