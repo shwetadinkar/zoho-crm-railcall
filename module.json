@@ -1,7 +1,7 @@
 {
   "id": "shweta/zoho-crm",
   "name": "zoho-crm",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "provider": "zoho",
   "category": "Revenue",
   "homepage": "https://github.com/shwetadinkar/zoho-crm-railcall",
