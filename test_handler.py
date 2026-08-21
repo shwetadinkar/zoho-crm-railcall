@@ -2987,6 +2987,400 @@ def t_verify_ledger_counts_reconciled():
     assert out2["entries"] == 1 and out2["reconciled"] == 1, out2
 
 
+
+
+# --------------------------------------------------- custody_report (0.9.0)
+#
+# The join. Most of what follows is proving each verdict is reached for the
+# right reason, because all three are cheap to produce by accident.
+
+_C_NOW = "2026-03-02T10:00:00+05:30"     # the record's current Modified_Time
+_C_NOW_UTC = "2026-03-02T04:30:00Z"      # the same instant, as the ledger has it
+_C_OLD = "2026-03-01T10:00:00+05:30"
+
+
+def _custody_helpers(rows, store=None):
+    """COQL id-lookups return whichever of `rows` were asked for; a plain
+    SELECT returns all of them, which is the `query` input's path."""
+    import re
+    calls = []
+    store = store if store is not None else {}
+
+    def _post(url, obj, **k):
+        q = (obj or {}).get("select_query", "")
+        calls.append(q)
+        found = re.search(r"in \(([^)]*)\)", q)
+        if found:
+            wanted = {x.strip() for x in found.group(1).split(",")}
+            out = [r for r in rows if str(r.get("id")) in wanted]
+        else:
+            out = list(rows)
+        return 200, json.dumps({"data": out}).encode()
+
+    return {"oauth_refresh": lambda p, **k: {"access_token": "t",
+                                             "instance_url": "https://x"},
+            "http_get_json": lambda u, **k: (200, b"{}"),
+            "http_post_json": _post,
+            "http_delete_json": lambda u, **k: (200, b"{}"),
+            "WS": "/tmp/rc-test",
+            "jload": lambda path, default=None: store.get(path, default if default is not None else {}),
+            "jsave": lambda path, obj: store.__setitem__(path, obj)}, calls, store
+
+
+def _custody_records(out, store):
+    return {r["id"]: r for r in store[out["report_path"]]["records"]}
+
+
+def t_custody_governed_traces_to_an_approval():
+    h, _c, _s = _custody_helpers([{"id": "1", "Modified_Time": _C_NOW,
+                                   "Modified_By": {"name": "The Module"}}])
+    m = load(h)
+    m._ledger_append(m._ledger_note(
+        "applied", "apply_update", "Leads", "k",
+        {"fields": ["S"],
+         "written": [{"id": "1", "modified_time": _C_NOW_UTC}]}))
+    out, err = m.zoho_custody_report({"module": "Leads",
+                                      "record_ids": ["1"]}, {})
+    assert err is None
+    assert (out["governed"], out["diverged"], out["unproven"]) == (1, 0, 0), out
+    assert out["governed_changes"] == 1, out
+
+
+def t_custody_diverged_names_the_time_and_who():
+    """The record moved after a governed write. That is the finding."""
+    h, _c, store = _custody_helpers([{"id": "1", "Modified_Time": _C_NOW,
+                                      "Modified_By": {"name": "Ada Editor"}}])
+    m = load(h)
+    m._ledger_append(m._ledger_note(
+        "applied", "apply_update", "Leads", "k",
+        {"fields": ["S"],
+         "written": [{"id": "1", "modified_time": "2026-03-01T04:30:00Z"}]}))
+    out, _err = m.zoho_custody_report({"module": "Leads",
+                                       "record_ids": ["1"]}, {})
+    assert out["diverged"] == 1, out
+    rec = _custody_records(out, store)["1"]
+    assert rec["custody"] == "diverged", rec
+    assert rec["ungoverned"] is True, rec
+    assert rec["current_modified_time"] == _C_NOW, rec
+    assert rec["current_modified_by"] == "Ada Editor", rec
+    assert rec["diverged_from"] == "2026-03-01T04:30:00Z", rec
+    # never a count of ungoverned edits - Zoho exposes no per-field history
+    assert "at least one change" in out["summary"], out["summary"]
+
+
+def t_custody_unproven_when_the_ledger_cannot_reach_back():
+    """No entry for this record, and the change predates the live chain."""
+    h, _c, store = _custody_helpers([{"id": "9", "Modified_Time": _C_OLD,
+                                      "Modified_By": {"name": "Someone"}}])
+    m = load(h)
+    # an unrelated entry, so covers_from exists and is AFTER the record's change
+    entry = m._ledger_append(m._ledger_note(
+        "applied", "apply_update", "Leads", "k",
+        {"written": [{"id": "1", "modified_time": _C_NOW_UTC}]}))
+    entry["at"] = "2026-06-01T00:00:00Z"
+    store["/tmp/rc-test/zoho_ledger.json"]["entries"][0]["at"] = "2026-06-01T00:00:00Z"
+    out, _err = m.zoho_custody_report({"module": "Leads",
+                                       "record_ids": ["9"]}, {})
+    assert out["unproven"] == 1 and out["diverged"] == 0, out
+    assert "predates the ledger" in _custody_records(out, store)["9"]["why"]
+
+
+def t_custody_unproven_is_not_diverged_when_entries_are_unmatchable():
+    """A merge is a real approval Zoho does not timestamp. Calling it diverged
+    would report an approved change as an ungoverned edit."""
+    h, _c, store = _custody_helpers([{"id": "1", "Modified_Time": _C_NOW,
+                                      "Modified_By": {"name": "x"}}])
+    m = load(h)
+    m._ledger_append(m._ledger_note(
+        "applied", "apply_merge", "Leads", "k",
+        {"master_id": "1", "losers": ["2"], "irreversible": True}))
+    out, _err = m.zoho_custody_report({"module": "Leads",
+                                       "record_ids": ["1"]}, {})
+    assert out["unproven"] == 1 and out["diverged"] == 0, out
+    assert "cannot be matched" in _custody_records(out, store)["1"]["why"]
+    assert out["unmatchable_ledger_entries"] == 1, out
+
+
+def t_custody_refusal_appears_in_the_timeline():
+    """The refusals are the evidence the control fired, and they only join
+    because refusals now carry ids."""
+    h, _c, store = _custody_helpers([{"id": "1", "Modified_Time": _C_NOW,
+                                      "Modified_By": {"name": "x"}}])
+    m = load(h)
+    m._ledger_append(m._ledger_note(
+        "refused", "apply_update", "Leads", "k",
+        {"reason": "state moved between plan and apply", "fields": ["S"],
+         "records": 1, "targets": ["1"]}))
+    out, _err = m.zoho_custody_report({"module": "Leads",
+                                       "record_ids": ["1"]}, {})
+    assert out["refusals"] == 1, out
+    rec = _custody_records(out, store)["1"]
+    kinds = [e["kind"] for e in rec["timeline"]]
+    assert kinds == ["refusal"], rec["timeline"]
+    assert rec["timeline"][0]["reason"] == "state moved between plan and apply"
+
+
+def t_custody_unresolved_write_carries_its_verdict():
+    h, _c, store = _custody_helpers([{"id": "1", "Modified_Time": _C_NOW,
+                                      "Modified_By": {"name": "x"}}])
+    m = load(h)
+    m._ledger_append(m._ledger_note(
+        "unresolved", "apply_update", "Leads", "k",
+        {"reason": "no verdict", "fields": ["S"],
+         "targets": [{"id": "1", "before": {"S": "old"},
+                      "before_modified_time": _C_OLD}]}))
+    m._ledger_append(m._ledger_note(
+        "reconciled", "reconcile_writes", "Leads", "k",
+        {"resolves_seq": 1, "resolved": True,
+         "verdicts": [{"id": "1", "verdict": "landed"}]}))
+    out, _err = m.zoho_custody_report({"module": "Leads",
+                                       "record_ids": ["1"]}, {})
+    assert out["unresolved"] == 1, out
+    rec = _custody_records(out, store)["1"]
+    # one event, not two: the verdict belongs to the attempt it adjudicated
+    assert [e["kind"] for e in rec["timeline"]] == ["unresolved_write"], rec
+    assert rec["timeline"][0]["verdict"] == "landed", rec["timeline"]
+    assert rec["timeline"][0]["verdict_recorded_as"] == 2, rec["timeline"]
+
+
+def t_custody_timeline_orders_every_source_together():
+    h, _c, store = _custody_helpers([{"id": "1", "Modified_Time": _C_NOW,
+                                      "Modified_By": {"name": "x"}}])
+    m = load(h)
+    m._ledger_append(m._ledger_note("applied", "apply_update", "Leads", "k",
+                                    {"written": [{"id": "1",
+                                                  "modified_time": _C_NOW_UTC}]}))
+    m._ledger_append(m._ledger_note("refused", "apply_delete", "Leads", "k2",
+                                    {"reason": "moved", "targets": ["1"]}))
+    m._ledger_append(m._ledger_note("unresolved", "apply_rollback", "Leads", "k3",
+                                    {"reason": "no verdict",
+                                     "targets": [{"id": "1"}]}))
+    out, _err = m.zoho_custody_report({"module": "Leads",
+                                       "record_ids": ["1"]}, {})
+    rec = _custody_records(out, store)["1"]
+    assert [e["kind"] for e in rec["timeline"]] == [
+        "governed_change", "refusal", "unresolved_write"], rec["timeline"]
+    assert [e["ledger_seq"] for e in rec["timeline"]] == [1, 2, 3], rec["timeline"]
+
+
+def t_custody_ids_go_to_the_file_not_the_receipt():
+    h, _c, store = _custody_helpers([{"id": "1", "Modified_Time": _C_NOW,
+                                      "Modified_By": {"name": "Ada Editor"}}])
+    m = load(h)
+    out, _err = m.zoho_custody_report({"module": "Leads",
+                                       "record_ids": ["1"]}, {})
+    blob = json.dumps(out)
+    assert '"1"' not in blob and "Ada Editor" not in blob, out
+    assert "records" in out and isinstance(out["records"], int), out
+    assert _custody_records(out, store)["1"]["id"] == "1", out
+
+
+def t_custody_deleted_record_is_unproven():
+    """A record that no longer reads back cannot be polled, and Zoho exposes
+    no history to reconstruct it from."""
+    h, _c, store = _custody_helpers([])
+    m = load(h)
+    m._ledger_append(m._ledger_note("applied", "apply_update", "Leads", "k",
+                                    {"written": [{"id": "1",
+                                                  "modified_time": _C_NOW_UTC}]}))
+    out, _err = m.zoho_custody_report({"module": "Leads",
+                                       "record_ids": ["1"]}, {})
+    assert out["unproven"] == 1, out
+    assert "no longer readable" in _custody_records(out, store)["1"]["why"]
+
+
+def t_custody_include_ungoverned_false_reads_nothing_and_claims_nothing():
+    h, calls, store = _custody_helpers([{"id": "1", "Modified_Time": _C_NOW,
+                                         "Modified_By": {"name": "x"}}])
+    m = load(h)
+    m._ledger_append(m._ledger_note("applied", "apply_update", "Leads", "k",
+                                    {"written": [{"id": "1",
+                                                  "modified_time": _C_NOW_UTC}]}))
+    out, _err = m.zoho_custody_report({"module": "Leads", "record_ids": ["1"],
+                                       "include_ungoverned": False}, {})
+    assert calls == [], calls
+    assert out["unchecked"] == 1 and out["governed"] == 0, out
+    assert out["governed_changes"] == 1, out
+    assert "custody cannot be determined" in _custody_records(out, store)["1"]["why"]
+
+
+def t_custody_accepts_a_query_instead_of_ids():
+    h, calls, _s = _custody_helpers([{"id": "1", "Modified_Time": _C_NOW,
+                                      "Modified_By": {"name": "x"}},
+                                     {"id": "2", "Modified_Time": _C_NOW,
+                                      "Modified_By": {"name": "x"}}])
+    m = load(h)
+    out, _err = m.zoho_custody_report(
+        {"module": "Leads", "query": "select id from Leads where x = 1"}, {})
+    assert out["records"] == 2, out
+    assert any("where x = 1" in q for q in calls), calls
+
+
+def t_custody_refuses_both_selectors_and_neither():
+    h, _c, _s = _custody_helpers([])
+    m = load(h)
+    try:
+        m.zoho_custody_report({"module": "Leads", "record_ids": ["1"],
+                               "query": "select id from Leads"}, {})
+        assert False
+    except RuntimeError as e:
+        assert "not both" in str(e), e
+    try:
+        m.zoho_custody_report({"module": "Leads"}, {})
+        assert False
+    except RuntimeError as e:
+        assert "record_ids" in str(e), e
+
+
+def t_custody_reports_unattributable_refusals_rather_than_hiding_them():
+    """A refusal recorded before refusals carried ids joins to nothing. Its
+    absence from a record's history must not read as 'never refused'."""
+    h, _c, _s = _custody_helpers([{"id": "1", "Modified_Time": _C_NOW,
+                                   "Modified_By": {"name": "x"}}])
+    m = load(h)
+    m._ledger_append(m._ledger_note("refused", "apply_update", "Leads", "k",
+                                    {"reason": "moved", "records": 4}))
+    out, _err = m.zoho_custody_report({"module": "Leads",
+                                       "record_ids": ["1"]}, {})
+    assert out["unattributed_refusals"] == 1, out
+    assert out["refusals"] == 0, out
+
+
+# ------------------------------------------------- the factored ledger index
+def t_ledger_index_is_the_only_join():
+    """_governed_index must be a view of _ledger_index, not a second walk.
+    Two implementations of this join would drift."""
+    h, _, _ = _ledger_helpers([], [])
+    m = load(h)
+    m._ledger_append(m._ledger_note("applied", "apply_update", "Leads", "k",
+                                    {"written": [{"id": "1",
+                                                  "modified_time": _C_NOW_UTC}]}))
+    governed, covers_from, unmatchable = m._governed_index()
+    index = m._ledger_index()
+    assert index["governed"] == governed, (index["governed"], governed)
+    assert index["covers_from"] == covers_from
+    assert index["unmatchable"] == unmatchable
+    # the expensive half is not built unless it is asked for
+    assert index["by_record"] is None, index["by_record"]
+    assert m._ledger_index(with_records=True)["by_record"], "not built on request"
+
+
+def t_entry_record_ids_reads_every_shape():
+    """Six commands, four ways of naming a record. Missing one would silently
+    drop a whole command's history out of custody_report."""
+    h, _, _ = _ledger_helpers([], [])
+    m = load(h)
+    cases = [
+        ({"written": [{"id": "1"}]}, ["1"]),
+        ({"before": [{"id": "2"}]}, ["2"]),
+        ({"targets": ["3"]}, ["3"]),
+        ({"targets": [{"id": "4"}]}, ["4"]),
+        ({"master_id": "5", "losers": ["6"]}, ["5", "6"]),
+        ({"archive": [{"id": "7"}]}, ["7"]),
+        ({"written": [{"id": "8"}], "before": [{"id": "8"}]}, ["8"]),
+    ]
+    for detail, want in cases:
+        got = m._entry_record_ids({"detail": detail})
+        assert got == want, (detail, got, want)
+
+
+def t_scan_changes_still_matches_after_the_factoring():
+    """The regression the factoring could have caused: scan_changes reads the
+    key set and nothing else, and its rule must not have moved."""
+    book = {"chain_start": "sha256:" + "0" * 64,
+            "entries": [{"outcome": "applied", "command": "apply_update",
+                         "module": "Leads", "plan_key": "k", "seq": 1,
+                         "at": "2026-03-02T04:30:00Z",
+                         "detail": {"written": [{"id": "1",
+                                                 "modified_time": _C_NOW_UTC}]}}]}
+    h = _change_helpers(rows_by_module={"Leads": [
+        {"id": "1", "Modified_Time": _C_NOW,
+         "Modified_By": {"name": "x"}, "Created_Time": _C_OLD}]}, ledger=book)
+    m = load(h)
+    out, _err = m.zoho_scan_changes({"modules": ["Leads"]}, {})
+    assert out["count"] == 1 and out["ungoverned_count"] == 0, out
+
+
+# ------------------------------------------- refusals now leave evidence
+def t_refused_delete_is_written_to_the_ledger():
+    """This path used to raise without recording anything, which made a
+    refused delete the one control firing that left no evidence."""
+    seq = [([{"id": "1"}], False), ([{"id": "1", "Modified_Time": "t1"}], False),
+           ([{"id": "1"}], False), ([{"id": "1", "Modified_Time": "MOVED"}], False)]
+    store, deleted = {}, []
+
+    def _post(url, obj, **k):
+        rows, more = seq.pop(0) if seq else ([], False)
+        return 200, json.dumps({"data": rows, "info": {"more_records": more}}).encode()
+
+    h = {"oauth_refresh": lambda p, **k: {"access_token": "t", "instance_url": "https://x"},
+         "http_get_json": lambda u, **k: (200, b"{}"), "http_post_json": _post,
+         "http_delete_json": lambda u, **k: (deleted.append(u), (200, b"{}"))[1],
+         "WS": "/tmp/rc-test",
+         "jload": lambda path, default=None: store.get(path, default if default is not None else {}),
+         "jsave": lambda path, obj: store.__setitem__(path, obj)}
+    m = load(h)
+    args = {"module": "Leads", "query": "select id from Leads where x = 1"}
+    m.zoho_plan_delete(args, {})
+    try:
+        m.zoho_apply_delete(args, {})
+        assert False, "drift not detected"
+    except RuntimeError as e:
+        assert "Refusing to delete" in str(e), e
+    assert not deleted, "delete issued despite drift"
+    entry = store["/tmp/rc-test/zoho_ledger.json"]["entries"][0]
+    assert entry["outcome"] == "refused" and entry["command"] == "apply_delete"
+    assert entry["detail"]["targets"] == ["1"], entry["detail"]
+
+
+def t_refused_handover_records_one_entry_per_module():
+    """The ledger is joined to a record on module and id, so one entry
+    spanning four modules could not be matched to any of them."""
+    hit = []
+    m, _calls = _handover_env(
+        USERS,
+        [[{"id": "1", "Modified_Time": "t1"}], [], [], [], []]
+        + [[{"id": "1", "Modified_Time": "t1"}, {"id": "9", "Modified_Time": "t1"}],
+           [{"id": "5", "Modified_Time": "t1"}], [], []],
+        put=lambda u, o, h: (hit.append(1), (200, b"{}"))[1])
+    args = {"from_user": "100", "to_user": "200"}
+    m.zoho_plan_handover(args, {})
+    try:
+        m.zoho_apply_handover(args, {})
+        assert False, "drift not detected"
+    except RuntimeError as e:
+        assert "changed since the plan" in str(e), e
+    assert not hit, "write attempted despite drift"
+    entries = m._ledger_load()["entries"]
+    assert [e["outcome"] for e in entries] == ["refused", "refused"], entries
+    by_module = {e["module"]: e["detail"]["targets"] for e in entries}
+    assert by_module == {"Leads": ["1", "9"], "Deals": ["5"]}, by_module
+
+
+def t_refusals_carry_targets_on_every_path():
+    """A count cannot be joined to a record. Pin this so a new refusal site
+    cannot be added without ids."""
+    import ast as _ast
+    tree = _ast.parse(open(HANDLER).read())
+    missing = []
+    for node in _ast.walk(tree):
+        if not isinstance(node, _ast.Call):
+            continue
+        fn = node.func
+        if not (isinstance(fn, _ast.Name) and fn.id == "_ledger_note"):
+            continue
+        if not node.args or not isinstance(node.args[0], _ast.Constant):
+            continue
+        if node.args[0].value != "refused":
+            continue
+        detail = node.args[-1]
+        keys = {k.value for k in getattr(detail, "keys", [])
+                if isinstance(k, _ast.Constant)}
+        if "targets" not in keys:
+            missing.append(getattr(node, "lineno", "?"))
+    assert not missing, "refusal notes without targets at lines %r" % missing
+
+
 for name, fn in sorted((k, v) for k, v in list(globals().items())
                        if k.startswith("t_")):
     check(name[2:], fn)

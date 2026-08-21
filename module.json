@@ -1,12 +1,12 @@
 {
   "id": "shweta/zoho-crm",
   "name": "zoho-crm",
-  "version": "0.8.1",
+  "version": "0.9.0",
   "provider": "zoho",
   "category": "Revenue",
   "homepage": "https://github.com/shwetadinkar/zoho-crm-railcall",
   "tests_url": "https://github.com/shwetadinkar/zoho-crm-railcall/blob/main/test_handler.py",
-  "description": "Governed Zoho CRM for small teams and AI agents. Thirty commands across Leads, Contacts, Accounts, Deals and any custom module. Every write is held behind the airlock and sealed into a signed receipt.\n\nWHO IT'S FOR: teams too small for a compliance function but regulated enough that 'who changed this client record, and who approved it' gets asked eventually.\n\nTHE PROBLEM: CRM has no undo. A wrong filter on a mass update rewrites 400 client records and there is no rollback, only a restore request. Zoho Flow and Zapier will both run that automation; neither can stop it, and neither records who authorised it.\n\nEIGHTEEN READS (no approval): verify_connection probes every scope and names any missing one plus what it blocks. describe_module returns every field including custom ones. search_records runs read-only COQL. list_records pages a module, get_record fetches one by id, list_users returns users and their ids. plan_update, plan_delete and plan_handover work out what a change would do without doing it. plan_rollback reports what undoing an applied change would restore. verify_ledger and audit_pack expose the local record of every change and every refusal. reconcile_writes re-reads the records behind a write Zoho never confirmed and says, per record, whether the current state is consistent with it having landed - an inference from Modified_Time and the recorded prior values, never a confirmation, because Zoho cannot be asked. plan_merge shows exactly what a merge would destroy: every field the master will overwrite, and everything attached that would move. plan_upsert reports the exact create/update split of a bulk upsert before anything is written. hygiene_scan finds what is quietly rotting - stale leads and deals, deals past their closing date still open, records with no email, records still owned by a deactivated user - and names the governed command that fixes each one. check_readiness tests one record against the fields the module requires plus any you name. scan_changes runs on the station's schedule and reports records changed since the last run, naming the ones with no approval behind them - the ledger sees only this module's writes, but Modified_Time does not, so an edit made in the Zoho UI becomes visible. It matches a change to an approval on the exact post-write timestamp Zoho returned, so an edit one second after an approved write is still reported rather than hidden behind it. Ungoverned edits only: a record deleted in the UI leaves nothing to poll.\n\nTWELVE WRITES (preview then approve): apply_update, apply_delete, apply_handover, apply_rollback, apply_merge and apply_upsert commit the matching plan, each refusing if the records moved since review. create_record and update_record work on any module, 100 per call. upsert_records inserts or updates against duplicate-check fields, 100 per call; plan_upsert and apply_upsert are the governed form for larger sets, paging the lookup and reporting the create/update split first. Drift there covers records that already exist - a record about to be created has no prior state to move. delete_record moves to the recycle bin. convert_lead turns a Lead into a Contact and Account. add_note writes reasoning back onto a record.\n\nPLAN THEN APPLY: an approval binds to the inputs a human saw, not to the records they point at. Approve a diff over 80 records, someone edits nine while it sits there, and the write lands on state nobody reviewed. Each plan snapshots the state it will change and fingerprints it; the matching apply re-reads, re-hashes, and refuses if anything moved. Scans page to completion, so a set is never half-reported. Applied changes are recorded in a hash-chained local ledger, so plan_rollback can restore prior values and audit_pack can show every refusal. A write that gets no answer from Zoho at all is recorded too, as a third outcome - unresolved - carrying what was attempted and each record's prior values and Modified_Time, so the question of whether it landed can still be settled afterwards.\n\nRELIABILITY: Zoho reports partial failure with HTTP 200, so a batch where 3 of 50 fail still looks successful. Every write returns succeeded, failed and per-record errors. Writes are never auto-retried: Zoho has no idempotency key. A write that returns no status or a 5xx has an outcome nobody can determine, so the module records the attempt in the ledger rather than reporting either success or failure. DEDUPE: merging is routine housekeeping and the most irreversible thing in the API. Zoho's bin entry for a merged record has no name and no deleted-by, and its restore endpoint answers 200 while doing nothing. apply_merge writes the loser's full record to the ledger before the merge fires - afterwards that is the only readable copy. No rollback. Setup and scopes: see README. contest:2026Q3",
+  "description": "Governed Zoho CRM for small teams and AI agents. Thirty-one commands across Leads, Contacts, Accounts, Deals and any custom module. Every write is held behind the airlock and sealed into a signed receipt.\n\nWHO IT'S FOR: teams too small for a compliance function but regulated enough that 'who changed this client record, and who approved it' gets asked eventually.\n\nTHE PROBLEM: CRM has no undo. A wrong filter on a mass update rewrites 400 client records and there is no rollback, only a restore request. Zoho Flow and Zapier will both run that automation; neither can stop it, and neither records who authorised it.\n\nNINETEEN READS (no approval): verify_connection probes every scope and names any missing one plus what it blocks. describe_module returns every field including custom ones. search_records runs read-only COQL. list_records pages a module, get_record fetches one by id, list_users returns users and their ids. plan_update, plan_delete and plan_handover work out what a change would do without doing it. plan_rollback reports what undoing an applied change would restore. verify_ledger and audit_pack expose the local record of every change and every refusal. reconcile_writes re-reads the records behind a write Zoho never confirmed and says, per record, whether the current state is consistent with it having landed - an inference from Modified_Time and the recorded prior values, never a confirmation, because Zoho cannot be asked. custody_report answers the question the listing exists for - for this record, what changed, who approved it, what was refused, and what the module cannot account for - as one timeline with a custody verdict per record: governed, diverged, or unproven. It detects THAT a record's current state was not produced by a governed write; it cannot enumerate every ungoverned edit, because Zoho exposes no per-field history. plan_merge shows exactly what a merge would destroy: every field the master will overwrite, and everything attached that would move. plan_upsert reports the exact create/update split of a bulk upsert before anything is written. hygiene_scan finds what is quietly rotting - stale leads and deals, deals past their closing date still open, records with no email, records still owned by a deactivated user - and names the governed command that fixes each one. check_readiness tests one record against the fields the module requires plus any you name. scan_changes runs on the station's schedule and reports records changed since the last run, naming the ones with no approval behind them - the ledger sees only this module's writes, but Modified_Time does not, so an edit made in the Zoho UI becomes visible. It matches a change to an approval on the exact post-write timestamp Zoho returned, so an edit one second after an approved write is still reported rather than hidden behind it. Ungoverned edits only: a record deleted in the UI leaves nothing to poll.\n\nTWELVE WRITES (preview then approve): apply_update, apply_delete, apply_handover, apply_rollback, apply_merge and apply_upsert commit the matching plan, each refusing if the records moved since review. create_record and update_record work on any module, 100 per call. upsert_records inserts or updates against duplicate-check fields, 100 per call; plan_upsert and apply_upsert are the governed form for larger sets, paging the lookup and reporting the create/update split first. Drift there covers records that already exist - a record about to be created has no prior state to move. delete_record moves to the recycle bin. convert_lead turns a Lead into a Contact and Account. add_note writes reasoning back onto a record.\n\nPLAN THEN APPLY: an approval binds to the inputs a human saw, not to the records they point at. Approve a diff over 80 records, someone edits nine while it sits there, and the write lands on state nobody reviewed. Each plan snapshots the state it will change and fingerprints it; the matching apply re-reads, re-hashes, and refuses if anything moved. Scans page to completion, so a set is never half-reported. Applied changes are recorded in a hash-chained local ledger, so plan_rollback can restore prior values and audit_pack can show every refusal. A write that gets no answer from Zoho at all is recorded too, as a third outcome - unresolved - carrying what was attempted and each record's prior values and Modified_Time, so the question of whether it landed can still be settled afterwards.\n\nRELIABILITY: Zoho reports partial failure with HTTP 200, so a batch where 3 of 50 fail still looks successful. Every write returns succeeded, failed and per-record errors. Writes are never auto-retried: Zoho has no idempotency key. A write that returns no status or a 5xx has an outcome nobody can determine, so the module records the attempt in the ledger rather than reporting either success or failure. DEDUPE: merging is routine housekeeping and the most irreversible thing in the API. Zoho's bin entry for a merged record has no name and no deleted-by, and its restore endpoint answers 200 while doing nothing. apply_merge writes the loser's full record to the ledger before the merge fires - afterwards that is the only readable copy. No rollback. Setup and scopes: see README. contest:2026Q3",
   "credential_spec": {
     "provider": "zoho",
     "category": "crm",
@@ -753,6 +753,58 @@
         "summary": "string"
       },
       "description": "Re-reads the records behind every write Zoho never returned a verdict on and reports, per record, whether the current state is consistent with the write having landed. Verdicts are INFERRED from the record's current value and Modified_Time - Zoho has no way to be asked whether a request landed, so nothing here is a confirmation. 'landed' means the value matches the intent and the record moved; another actor making the same change independently is indistinguishable. What can be established differs by which command made the attempt, so each entry is judged on the basis it recorded: an apply_upsert entry can never read as landed because the values it overwrote were never read, and a merge is checked for existence only. Records go to a file; the counts come back inline."
+    },
+    {
+      "id": "zoho.custody_report",
+      "title": "Who changed this record, who approved it, what was refused",
+      "provider": "zoho",
+      "risk": "low",
+      "mode": "read",
+      "requires": [
+        "ZOHO_OAUTH"
+      ],
+      "preview": false,
+      "receipt_required": true,
+      "input_schema": {
+        "module": {
+          "type": "string",
+          "required": true,
+          "description": "Zoho module API name, e.g. Leads."
+        },
+        "record_ids": {
+          "type": "array",
+          "required": false,
+          "description": "Record ids to report on. Give this or 'query', not both."
+        },
+        "query": {
+          "type": "string",
+          "required": false,
+          "description": "COQL SELECT choosing the records instead. Capped at 500."
+        },
+        "include_ungoverned": {
+          "type": "boolean",
+          "required": false,
+          "description": "Read each record's current Modified_Time to detect ungoverned change. Default true; false skips the Zoho read and returns no custody verdict."
+        }
+      },
+      "output_schema": {
+        "module": "string",
+        "records": "number",
+        "governed": "number",
+        "diverged": "number",
+        "unproven": "number",
+        "unchecked": "number",
+        "governed_changes": "number",
+        "refusals": "number",
+        "unresolved": "number",
+        "ledger_covers_from": "string",
+        "unmatchable_ledger_entries": "number",
+        "unattributed_refusals": "number",
+        "report_path": "string",
+        "covers": "string",
+        "summary": "string"
+      },
+      "description": "Joins the three bodies of evidence this module holds - the ledger of what it did, the refusals of what it stopped, and the records' current state - into one timeline per record, and gives each a custody verdict. 'governed' means the current state traces to an approved write. 'diverged' means it does not. 'unproven' means the ledger cannot reach back far enough to say, and is not a failure: it is the module declining to claim coverage it does not have. THE LIMIT, stated in the output too: this detects THAT a record's current state was not produced by a governed write. It cannot enumerate every ungoverned edit, because Zoho exposes no per-field history and Modified_Time holds only the most recent change. Ids and timelines go to a file; counts come back inline."
     },
     {
       "id": "zoho.plan_rollback",

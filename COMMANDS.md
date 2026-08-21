@@ -1,6 +1,6 @@
 # shweta/zoho-crm - command reference
 
-Thirty commands. Eighteen reads, which run without approval. Twelve
+Thirty-one commands. Nineteen reads, which run without approval. Twelve
 writes, which stop at the airlock until a human approves the exact payload.
 
 Examples below use Zoho's own demo records, so you can follow along in a fresh
@@ -1024,6 +1024,124 @@ fake-green this module exists to avoid.
   not re-examined, and reported as `already_committed`.
 - A merge is checked for existence only.
 
+## zoho.custody_report
+
+The question the module exists for, in one command: for this record, what
+changed, who approved it, what was refused, and what the module cannot account
+for. Read-only.
+
+The ledger records what the module did. `scan_changes` finds what happened
+outside it, on a schedule. This joins them, for a named set of records, on
+demand.
+
+| input | type | required | notes |
+|---|---|---|---|
+| `module` | string | yes | Zoho module API name |
+| `record_ids` | array | no | the records to report on |
+| `query` | string | no | COQL SELECT choosing them instead; capped at 500 |
+| `include_ungoverned` | boolean | no | default true; false skips the Zoho read |
+
+Give `record_ids` or `query`, not both.
+
+```json
+{ "module": "Leads", "record_ids": ["554023000000418001"] }
+```
+
+```json
+{
+  "ok": true,
+  "module": "Leads",
+  "records": 3,
+  "governed": 1,
+  "diverged": 1,
+  "unproven": 1,
+  "unchecked": 0,
+  "governed_changes": 4,
+  "refusals": 2,
+  "unresolved": 1,
+  "ledger_covers_from": "2026-08-01T07:02:19Z",
+  "unmatchable_ledger_entries": 6,
+  "unattributed_refusals": 0,
+  "report_path": "/home/you/.railcall/station/.railcall_workspace/custody_report.20260821T101500Z.json",
+  "summary": "3 Leads records: 1 governed, 1 diverged, 1 unproven. ..."
+}
+```
+
+Counts inline, ids and timelines in the file. `redact_output` strips
+identifiers out of a receipt, so a per-record verdict returned inline would come
+back as `[account]: diverged` and answer nobody's question.
+
+### The three verdicts
+
+**`governed`** - the record's current `Modified_Time` matches a post-write
+timestamp this module recorded. Its current state was produced by an approved
+write.
+
+**`diverged`** - it does not, and the ledger is in a position to know. Reported
+with the current `Modified_Time`, the `Modified_By`, and the governed timestamp
+it diverged from.
+
+**`unproven`** - the ledger cannot reach back far enough to say. This is not a
+failure. It is the module declining to claim coverage it does not have, and it
+is the most important of the three: without it the other two mean nothing,
+because a report that never says "I don't know" is a report that says "governed"
+when it should have said nothing.
+
+A record is `unproven` rather than `diverged` when any of these hold, and the
+file says which:
+
+- there is no ledger entry for it and its change predates `ledger_covers_from`
+- every entry it does have is unmatchable - merges, which Zoho does not
+  timestamp, and anything written before the ledger recorded `Modified_Time`.
+  Calling those diverged would report a real approval as an ungoverned edit
+- the record no longer reads back, deleted or merged in the UI
+- `include_ungoverned` was false, in which case the verdict is `unchecked`:
+  nothing was read, so nothing is claimed
+
+### The limit that has to be stated plainly
+
+This detects **that** a record's current state was not produced by a governed
+write. It cannot enumerate every ungoverned edit that ever happened. Zoho
+exposes no per-field history and `Modified_Time` holds only the most recent
+change.
+
+So the honest reading of `diverged` is *"at least one change to this record was
+not governed, most recently at T by U"* - never *"three ungoverned changes"*.
+The output uses that phrasing and this document will not offer you a better one,
+because there isn't one.
+
+`scan_changes` and `custody_report` are complementary and neither replaces the
+other. `scan_changes` catches ungoverned edits going forward, on a schedule, so
+a change is seen near the time it happens. `custody_report` answers the question
+for a named record on demand, at whatever resolution the API allows.
+
+### The timeline
+
+Per record, in the file, every source merged and ordered:
+
+- **governed changes** - `applied` entries whose `written` names this record.
+  Each carries the command, `plan_key`, ledger `seq`, timestamp, fields changed,
+  and the post-write `Modified_Time` Zoho returned, which is the anchor for
+  everything else
+- **refusals** - `refused` entries whose targets include this id, with the
+  reason. These matter more than the successes: they are the only direct
+  evidence the control fired
+- **unresolved writes** - with the reconciled verdict attached to the attempt it
+  adjudicated, rather than floating beside it as if it were a second event
+
+### Other limits, all in the output
+
+- Ledger coverage starts at `ledger_covers_from`, the earliest entry in the live
+  chain. The chain rotates at 5000 entries and sealed archives are not read.
+- `unmatchable_ledger_entries` counts approvals with no recorded post-write
+  `Modified_Time` that therefore cannot be matched to any record's current
+  state.
+- `unattributed_refusals` counts refusals recorded before refusals carried
+  record ids. They join to nothing, and the count is reported so their absence
+  from a record's history is not read as "the control never fired here".
+- `Modified_By` names the OAuth user for this module's own writes, so it
+  identifies a person only for changes the module did not make.
+
 ## zoho.apply_update
 
 Commits a plan from `plan_update`. Re-runs the query, re-hashes the current
@@ -1521,9 +1639,11 @@ worse - the module knew exactly what it had tried to do and threw that away at
 the moment it became most useful.
 
 `zoho.reconcile_writes` turns these back into answers, as far as the API
-allows.
+allows, and `zoho.custody_report` puts the result in a record's history beside
+the approvals and refusals.
 
-`apply_delete` and `apply_handover` write a ledger entry only in this
-unresolved case. A successful delete or handover is not yet recorded, so
-`scan_changes` reports both as ungoverned. That is a real gap in coverage, named
+`apply_delete` and `apply_handover` record their refusals, and record an
+unresolved write when one happens. A **successful** delete or handover is still
+not recorded, so `scan_changes` reports both as ungoverned and `custody_report`
+will call an affected record `diverged`. That is a real gap in coverage, named
 here rather than left to be discovered.

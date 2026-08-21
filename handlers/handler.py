@@ -1,4 +1,4 @@
-"""shweta/zoho-crm 0.8.1
+"""shweta/zoho-crm 0.9.0
 
 Vault entry `zoho`:
 
@@ -689,44 +689,186 @@ def _iso_utc(value):
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(secs))
 
 
-def _governed_index():
-    """What the ledger can vouch for, and where its knowledge starts.
+def _entry_record_ids(entry):
+    """Every record id one ledger entry names, however it names them.
 
-    Returns (governed, covers_from, unmatchable).
+    Six commands write entries and they do not agree on where the ids live:
+    an applied entry has `written`, an unresolved one has `targets` objects, a
+    refusal has `targets` as bare ids, and a merge scatters them across
+    `master_id`, `losers` and an `archive`. Reading the union in one place is
+    the difference between custody_report joining on all of them and joining on
+    whichever shape whoever wrote the join happened to remember.
+    """
+    detail = entry.get("detail") or {}
+    ids = []
+    for row in (detail.get("written") or []):
+        if isinstance(row, dict) and row.get("id"):
+            ids.append(str(row["id"]))
+    for row in (detail.get("before") or []):
+        if isinstance(row, dict) and row.get("id"):
+            ids.append(str(row["id"]))
+    for row in (detail.get("targets") or []):
+        if isinstance(row, dict) and row.get("id"):
+            ids.append(str(row["id"]))
+        elif isinstance(row, (str, int)):
+            ids.append(str(row))
+    for row in (detail.get("archive") or []):
+        if isinstance(row, dict) and row.get("id"):
+            ids.append(str(row["id"]))
+    if detail.get("master_id"):
+        ids.append(str(detail["master_id"]))
+    for lid in (detail.get("losers") or []):
+        if isinstance(lid, (str, int)):
+            ids.append(str(lid))
+    seen, out = set(), []
+    for rid in ids:
+        if rid not in seen:
+            seen.add(rid)
+            out.append(rid)
+    return out
 
-    `governed` holds "module:id:modified_at" keys built from the post-write
-    Modified_Time this module recorded. Zoho returns that value on every
-    SUCCESS row and it is byte-identical to a later read, so a change either
-    matches an approval exactly or it does not. No tolerance window: a UI edit
-    landing one second after a module write stays visible.
 
-    `covers_from` is the earliest entry in the live chain. The ledger rotates
-    past _LEDGER_MAX into sealed archives this does not read, so claiming
-    coverage before that point would report governed changes as ungoverned.
+def _ledger_index(with_records=False):
+    """One walk of the live chain, and the only place the ledger is joined to
+    record ids.
 
-    `unmatchable` counts applied entries with no recorded Modified_Time --
-    everything written before the ledger began recording it, plus every merge,
-    which Zoho's merge response does not timestamp. Those are real approvals
-    this cannot match, so the count is reported rather than their records being
-    quietly called ungoverned.
+    Returns a dict:
+
+      governed     "module:id:modified_at" keys built from the post-write
+                   Modified_Time this module recorded. Zoho returns that value
+                   on every SUCCESS row and it is byte-identical to a later
+                   read, so a change either matches an approval exactly or it
+                   does not. No tolerance window: a UI edit landing one second
+                   after a module write stays visible.
+      covers_from  the earliest entry in the live chain. The ledger rotates
+                   past _LEDGER_MAX into sealed archives this does not read, so
+                   claiming coverage before that point would report governed
+                   changes as ungoverned.
+      unmatchable  applied entries with no recorded Modified_Time -- everything
+                   written before the ledger began recording it, plus every
+                   merge, which Zoho's merge response does not timestamp. Those
+                   are real approvals this cannot match, so the count is
+                   reported rather than their records quietly called
+                   ungoverned.
+      by_record    {"module:id": {"applied": [...], "refused": [...],
+                   "unresolved": [...], "reconciled": [...]}}, or None.
+      unattributed_refusals
+                   refusals recorded before refusals carried record ids. They
+                   cannot be joined to anything, and the count is reported so
+                   their absence from a record's history is not read as "the
+                   control never fired here". Only counted when by_record is
+                   built, since it is the only consumer.
+
+    `by_record` is built only when asked for. scan_changes wants the key set
+    and nothing else, and it runs on the station's schedule against a chain
+    holding up to _LEDGER_MAX entries; assembling a per-record timeline it will
+    never read would be work on every scheduled run for nothing.
+
+    Both callers walk the same entries under the same matching rule on purpose.
+    Two implementations of this join would drift, and the one that drifted
+    would be the one nobody was watching.
     """
     governed, unmatchable, covers_from = set(), 0, None
+    unattributed_refusals = 0
+    by_record = {} if with_records else None
+
     for entry in (_ledger_load().get("entries") or []):
         at = entry.get("at")
         if at and (covers_from is None or at < covers_from):
             covers_from = at
-        if entry.get("outcome") != "applied":
+        outcome = entry.get("outcome")
+        module = entry.get("module")
+        detail = entry.get("detail") or {}
+
+        if outcome == "applied":
+            rows = detail.get("written")
+            if not rows:
+                unmatchable += 1
+            else:
+                for row in rows:
+                    rid = (row or {}).get("id")
+                    stamp = _iso_utc((row or {}).get("modified_time"))
+                    if rid and stamp:
+                        governed.add("%s:%s:%s" % (module, rid, stamp))
+
+        if by_record is None:
             continue
-        rows = (entry.get("detail") or {}).get("written")
-        if not rows:
-            unmatchable += 1
+
+        # A reconciled entry names no records of its own; it points at the
+        # unresolved entry it adjudicated. Filed under that entry's records so
+        # a timeline shows the verdict beside the attempt it belongs to.
+        if outcome == "reconciled":
             continue
-        for row in rows:
-            rid = (row or {}).get("id")
-            stamp = _iso_utc((row or {}).get("modified_time"))
-            if rid and stamp:
-                governed.add("%s:%s:%s" % (entry.get("module"), rid, stamp))
-    return governed, covers_from, unmatchable
+
+        written_at = {}
+        for row in (detail.get("written") or []):
+            if isinstance(row, dict) and row.get("id"):
+                written_at[str(row["id"])] = row.get("modified_time")
+
+        found_ids = _entry_record_ids(entry)
+        if outcome == "refused" and not found_ids:
+            unattributed_refusals += 1
+
+        for rid in found_ids:
+            slot = by_record.setdefault("%s:%s" % (module, rid),
+                                        {"applied": [], "refused": [],
+                                         "unresolved": [], "reconciled": []})
+            if outcome not in slot:
+                continue
+            slot[outcome].append({
+                "seq": entry.get("seq"),
+                "at": at,
+                "command": entry.get("command"),
+                "plan_key": entry.get("plan_key"),
+                "fields": detail.get("fields"),
+                "reason": detail.get("reason"),
+                "written_modified_time": written_at.get(rid),
+            })
+
+    if by_record is not None:
+        # Second pass, because a reconciled entry can only be attached once the
+        # unresolved entry it resolves is already in place.
+        _attach_reconciled(by_record)
+
+    return {"governed": governed, "covers_from": covers_from,
+            "unmatchable": unmatchable, "by_record": by_record,
+            "unattributed_refusals": unattributed_refusals}
+
+
+def _attach_reconciled(by_record):
+    """File each reconciled entry against the records it adjudicated."""
+    by_seq = {}
+    for key, slot in by_record.items():
+        for row in slot["unresolved"]:
+            by_seq.setdefault(row["seq"], []).append(key)
+
+    for entry in (_ledger_load().get("entries") or []):
+        if entry.get("outcome") != "reconciled":
+            continue
+        detail = entry.get("detail") or {}
+        verdicts = {str((v or {}).get("id")): (v or {}).get("verdict")
+                    for v in (detail.get("verdicts") or [])
+                    if isinstance(v, dict)}
+        for key in by_seq.get(detail.get("resolves_seq"), []):
+            rid = key.split(":", 1)[1]
+            by_record[key]["reconciled"].append({
+                "seq": entry.get("seq"),
+                "at": entry.get("at"),
+                "resolves_seq": detail.get("resolves_seq"),
+                "resolved": detail.get("resolved"),
+                "verdict": verdicts.get(rid),
+                "merge_state": detail.get("merge_state"),
+            })
+
+
+def _governed_index():
+    """The key-set view of the ledger, for scan_changes.
+
+    Kept as a name of its own because scan_changes reads exactly three things
+    and should not have to know the shape of the fuller index.
+    """
+    index = _ledger_index()
+    return index["governed"], index["covers_from"], index["unmatchable"]
 
 
 def _strip_limit(query):
@@ -924,7 +1066,8 @@ def zoho_apply_update(inputs, stamp):
             _plan_key(module, query, changes),
             {"reason": "state moved between plan and apply",
              "expected": expected, "actual": actual,
-             "records": len(snapshot), "fields": fields}))
+             "records": len(snapshot), "fields": fields,
+             "targets": [r["id"] for r in snapshot]}))
         raise RuntimeError(
             "Refusing to apply. The records moved since the plan was made: "
             "%d now match the query and the state fingerprint is %s, not %s. "
@@ -1030,6 +1173,18 @@ def zoho_apply_delete(inputs, stamp):
     actual, snapshot = _fingerprint(module, current, _DELETE_GUARD_FIELDS)
 
     if actual != stored.get("fingerprint"):
+        # This path used to raise without recording anything, which made a
+        # refused delete the one control firing that left no evidence - the
+        # exact opposite of what the ledger is for, and a hole custody_report
+        # would have reported as an absence of refusals rather than an absence
+        # of records.
+        _ledger_append(_ledger_note(
+            "refused", "apply_delete", module,
+            _plan_key("delete:" + module, query, {}),
+            {"reason": "state moved between plan and apply",
+             "expected": stored.get("fingerprint"), "actual": actual,
+             "records": len(snapshot),
+             "targets": [r["id"] for r in snapshot]}))
         raise RuntimeError(
             "Refusing to delete. The records moved since the plan was made: %d "
             "now match and the state fingerprint no longer agrees. Re-run "
@@ -1468,7 +1623,8 @@ def zoho_apply_merge(inputs, stamp):
             "refused", "apply_merge", module, key,
             {"reason": "state moved between plan and apply",
              "expected": expected, "actual": actual,
-             "master_id": master_id, "losers": len(loser_ids)}))
+             "master_id": master_id, "losers": len(loser_ids),
+             "targets": [master_id] + list(loser_ids)}))
         raise RuntimeError(
             "Refusing to merge. One of these records moved since the plan was "
             "made: the state fingerprint is %s, not %s. A merge cannot be "
@@ -1773,7 +1929,10 @@ def zoho_apply_upsert(inputs, stamp):
             "refused", "apply_upsert", module, key,
             {"reason": "an existing record moved between plan and apply",
              "expected": expected, "actual": actual,
-             "updates": len(ids), "creates": stored.get("creates")}))
+             "updates": len(ids), "creates": stored.get("creates"),
+             # The records that already exist. A create has no id yet, so a
+             # refused upsert can only name the half that does.
+             "targets": [str(i) for i in ids]}))
         raise RuntimeError(
             "Refusing to upsert. One of the %d records that already exist "
             "moved since the plan was made: the state fingerprint is %s, not "
@@ -2372,17 +2531,32 @@ def zoho_apply_handover(inputs, stamp):
 
     found, before_times = _handover_scan(module_names, str(leaver["id"]),
                                          closed == "include")
+    handover_key = _plan_key("handover",
+                             str(leaver["id"]) + ">" + str(taker["id"]),
+                             {"modules": module_names, "closed": closed})
     if _handover_fingerprint(found) != stored.get("fingerprint"):
         now = {m: len(v) for m, v in found.items()}
+        # One entry per module, because the ledger is joined to a record on
+        # module and id - a single entry spanning four modules could not be
+        # matched to any of them. Written before the raise, like every other
+        # refusal.
+        for _module, _ids in found.items():
+            if not _ids:
+                continue
+            _ledger_append(_ledger_note(
+                "refused", "apply_handover", _module, handover_key,
+                {"reason": "what the leaver owns changed between plan and apply",
+                 "expected": stored.get("found"), "actual": now,
+                 "fields": ["Owner"],
+                 "from_user": str(leaver["id"]), "to_user": str(taker["id"]),
+                 "records": len(_ids),
+                 "targets": [str(i) for i in _ids]}))
         raise RuntimeError(
             "Refusing to hand over. What %s owns changed since the plan was "
             "made: now %s, planned %s. Re-run zoho.plan_handover."
             % (leaver.get("full_name"), now, stored.get("found")))
 
     owner = {"Owner": {"id": str(taker["id"])}}
-    handover_key = _plan_key("handover",
-                             str(leaver["id"]) + ">" + str(taker["id"]),
-                             {"modules": module_names, "closed": closed})
     moved, failed, errors = 0, 0, []
     done = {}
     for module, ids in found.items():
@@ -2632,8 +2806,14 @@ def _ledger_load():
 def _ledger_append(record):
     """Append one entry and return it, chained to whatever came before.
 
-    Called on every apply - successful or refused. A refusal is the more
-    valuable of the two: it is the only direct evidence the control works.
+    Called on every apply that refuses, and on every apply that succeeds except
+    apply_delete and apply_handover - see their own notes. A refusal is the
+    more valuable of the two: it is the only direct evidence the control works,
+    and custody_report reads them.
+
+    Every refusal carries `targets`, the ids it declined to touch. A count
+    cannot be joined to a record, so an entry without them is evidence that a
+    control fired on somebody, which is not the question anyone asks.
     """
     helpers = __rc_helpers__  # noqa: F821
     book = _ledger_load()
@@ -3348,6 +3528,325 @@ def zoho_reconcile_writes(inputs, stamp):
     }, None
 
 
+
+
+# --- custody ----------------------------------------------------------------
+#
+# The manifest says the audience is people who get asked "who changed this
+# client record, and who approved it". The module has held three separate
+# bodies of evidence for that question - the ledger (what it did), scan_changes
+# (what happened outside it), and refusals (what it stopped) - and never joined
+# them. Answering took reading three outputs and joining them by hand.
+#
+# This is the join. It adds no new read of Zoho beyond one Modified_Time
+# lookup, because everything else it needs is already on disk.
+
+_CUSTODY_CAP = 500        # records per report; a custody answer is read by a
+                          # human, and a thousand-row one is not read at all
+
+
+def _custody_ids(inputs, module):
+    """Ids from `record_ids`, or from a COQL query, but not from neither."""
+    raw = inputs.get("record_ids")
+    query = str(inputs.get("query", "")).strip()
+    if raw and query:
+        raise RuntimeError("Give 'record_ids' or 'query', not both.")
+
+    if raw:
+        if not isinstance(raw, list):
+            raise RuntimeError("'record_ids' must be a list of record ids.")
+        ids = [str(r).strip() for r in raw if str(r).strip()]
+        bad = [r for r in ids if not r.isdigit()]
+        if bad:
+            raise RuntimeError("Zoho record ids are numeric; these are not: %r"
+                               % bad[:5])
+    elif query:
+        if not query.lower().lstrip("( ").startswith("select"):
+            raise RuntimeError("'query' must be a COQL SELECT.")
+        rows, hit_cap = _coql_capped(_strip_limit(query), cap=_CUSTODY_CAP,
+                                     label="custody query")
+        if hit_cap:
+            raise RuntimeError(
+                "That query matches more than %d records. A custody report is "
+                "read by a person; narrow it rather than producing a file "
+                "nobody will open." % _CUSTODY_CAP)
+        ids = [str(r.get("id")) for r in rows if r.get("id")]
+    else:
+        raise RuntimeError("Give either 'record_ids' or 'query' to say which "
+                           "records to report on.")
+
+    if not ids:
+        raise RuntimeError("No records to report on.")
+    if len(ids) > _CUSTODY_CAP:
+        raise RuntimeError("%d records is over the %d-record cap for one "
+                           "report." % (len(ids), _CUSTODY_CAP))
+    return ids
+
+
+def _custody_timeline(slot):
+    """Every source for one record, merged and ordered.
+
+    A reconciled verdict is attached to the unresolved attempt it adjudicated
+    rather than floating on its own, because on its own it reads like a second
+    event and there was only ever one.
+    """
+    events = []
+    for row in slot["applied"]:
+        events.append({"at": row["at"], "kind": "governed_change",
+                       "command": row["command"], "ledger_seq": row["seq"],
+                       "plan_key": row["plan_key"], "fields": row["fields"],
+                       "written_modified_time": row["written_modified_time"]})
+    for row in slot["refused"]:
+        events.append({"at": row["at"], "kind": "refusal",
+                       "command": row["command"], "ledger_seq": row["seq"],
+                       "plan_key": row["plan_key"], "fields": row["fields"],
+                       "reason": row["reason"]})
+    verdicts = {}
+    for row in slot["reconciled"]:
+        verdicts[row["resolves_seq"]] = row
+    for row in slot["unresolved"]:
+        found = verdicts.get(row["seq"])
+        events.append({"at": row["at"], "kind": "unresolved_write",
+                       "command": row["command"], "ledger_seq": row["seq"],
+                       "plan_key": row["plan_key"], "fields": row["fields"],
+                       "reason": row["reason"],
+                       "verdict": (found or {}).get("verdict"),
+                       "verdict_recorded_as": (found or {}).get("seq"),
+                       "merge_state": (found or {}).get("merge_state")})
+    events.sort(key=lambda e: (e["at"] or "", e["ledger_seq"] or 0))
+    return events
+
+
+def _custody_verdict(slot, current, governed, covers_from):
+    """One record's custody verdict, and why.
+
+    Returns (verdict, diverged_from, note). The three verdicts answer three
+    different questions and `unproven` is the important one: it is the module
+    declining to claim coverage it does not have, which is the only reason the
+    other two are worth anything.
+    """
+    applied = slot["applied"]
+    last_written = None
+    for row in applied:
+        stamp = row.get("written_modified_time")
+        if stamp and (last_written is None or stamp > last_written):
+            last_written = stamp
+
+    if current is None:
+        # Deleted or merged since. scan_changes has the same blind spot for the
+        # same reason: a record that no longer reads back cannot be polled, and
+        # its history cannot be reconstructed from an API that exposes none.
+        return "unproven", last_written, ("record no longer readable; deleted "
+                                          "or merged, and Zoho exposes no "
+                                          "history to reconstruct it from")
+
+    now = _iso_utc(current.get("Modified_Time"))
+    if now is None:
+        return "unproven", last_written, "record has no readable Modified_Time"
+
+    if "%s:%s:%s" % (current["_module"], current["_id"], now) in governed:
+        return "governed", last_written, ("current state was produced by a "
+                                          "governed write")
+
+    if applied and last_written is None:
+        # Every approval this record has is one the ledger cannot match: merges,
+        # which Zoho does not timestamp, and anything written before the ledger
+        # recorded Modified_Time. Calling that diverged would report a real
+        # approval as an ungoverned edit.
+        return "unproven", None, ("this record's ledger entries predate the "
+                                  "recorded post-write timestamp, so they "
+                                  "cannot be matched to its current state")
+
+    if last_written is not None:
+        # The ledger holds a matchable governed write for THIS record, so
+        # coverage is not in question whatever covers_from says - a record the
+        # chain demonstrably knows about cannot also be outside its reach.
+        # Checked before covers_from, because the reverse order calls a genuine
+        # divergence unproven whenever the divergence is older than the oldest
+        # surviving entry, which is exactly when it matters most.
+        if now > last_written:
+            return "diverged", last_written, ("current state was not produced "
+                                              "by a governed write")
+        return "unproven", last_written, (
+            "current state is older than the last governed write recorded for "
+            "it, which should not happen; treat the ledger and the record as "
+            "disagreeing rather than trusting either")
+
+    if covers_from is None or now < covers_from:
+        return "unproven", None, ("no ledger entry for this record, and the "
+                                  "change predates the ledger's coverage; the "
+                                  "chain rotates and sealed archives are not "
+                                  "read here")
+
+    return "diverged", None, ("no ledger entry for this record within the "
+                              "ledger's coverage, so its current state was "
+                              "not produced by a governed write")
+
+
+def zoho_custody_report(inputs, stamp):
+    """For these records: what changed, who approved it, what was refused, and
+    what the module cannot account for. Read-only.
+
+    The ledger records what this module did. scan_changes finds what happened
+    outside it, on a schedule. This answers the question those two exist for,
+    for a named set of records, on demand.
+
+    THE LIMIT THAT MATTERS, and it is in the output as well as here: this
+    detects THAT a record's current state was not produced by a governed write.
+    It cannot enumerate every ungoverned edit that ever happened. Zoho exposes
+    no per-field history and Modified_Time holds only the most recent change,
+    so the honest phrasing is "at least one change to this record was not
+    governed, most recently at T by U" - never "three ungoverned changes".
+
+    The other limits carry over from scan_changes and are reported too:
+      - Ledger coverage starts at the earliest entry in the live chain, because
+        the chain rotates and sealed archives are not read here.
+      - Entries predating the recorded post-write Modified_Time cannot be
+        matched to a record's current state.
+      - A record deleted or merged in the UI leaves nothing to poll.
+      - Modified_By names the OAuth user for this module's own writes, so it
+        identifies a person only for changes the module did not make.
+      - Refusals recorded before targets were added carry no ids and cannot be
+        attributed to a record. The count is reported rather than their absence
+        being read as "nothing was ever refused".
+
+    inputs: module (string, required), record_ids (array) or query (COQL),
+            include_ungoverned (boolean, default true)
+    """
+    helpers = __rc_helpers__  # noqa: F821
+    module = _module_name(inputs)
+    ids = _custody_ids(inputs, module)
+    raw_flag = inputs.get("include_ungoverned")
+    include_ungoverned = True if raw_flag in (None, "") else bool(raw_flag)
+
+    index = _ledger_index(with_records=True)
+    by_record = index["by_record"]
+    governed_keys = index["governed"]
+    covers_from = index["covers_from"]
+
+    current_by_id = {}
+    if include_ungoverned:
+        # The one extra read. Everything else this command needs is on disk.
+        for start in range(0, len(ids), 100):
+            for row in _read_by_ids(module, ids[start:start + 100],
+                                    ["Modified_Time", "Modified_By"]):
+                if row.get("id"):
+                    rid = str(row["id"])
+                    row["_module"], row["_id"] = module, rid
+                    current_by_id[rid] = row
+
+    empty = {"applied": [], "refused": [], "unresolved": [], "reconciled": []}
+    verdicts = {"governed": 0, "diverged": 0, "unproven": 0, "unchecked": 0}
+    totals = {"governed_changes": 0, "refusals": 0, "unresolved": 0}
+    records = []
+
+    for rid in ids:
+        slot = by_record.get("%s:%s" % (module, rid), empty)
+        totals["governed_changes"] += len(slot["applied"])
+        totals["refusals"] += len(slot["refused"])
+        totals["unresolved"] += len(slot["unresolved"])
+
+        if not include_ungoverned:
+            # Without the current Modified_Time there is nothing to compare a
+            # governed write against, so no custody verdict is possible. Saying
+            # "governed" off the ledger alone would be exactly the claim this
+            # command exists to stop anyone making.
+            verdict, diverged_from, note = "unchecked", None, (
+                "include_ungoverned was false, so the record's current state "
+                "was not read and custody cannot be determined")
+            current = None
+        else:
+            current = current_by_id.get(rid)
+            verdict, diverged_from, note = _custody_verdict(
+                slot, current, governed_keys, covers_from)
+
+        verdicts[verdict] += 1
+        by = (current or {}).get("Modified_By") or {}
+        records.append({
+            "id": rid,
+            "custody": verdict,
+            "why": note,
+            "current_modified_time": (current or {}).get("Modified_Time"),
+            "current_modified_by": by.get("name") if isinstance(by, dict) else by,
+            "diverged_from": diverged_from if verdict == "diverged" else None,
+            "governed_changes": len(slot["applied"]),
+            "refusals": len(slot["refused"]),
+            "unresolved": len(slot["unresolved"]),
+            "ungoverned": verdict == "diverged",
+            "timeline": _custody_timeline(slot),
+        })
+
+    limits = [
+        "Detects THAT a record's current state was not produced by a governed "
+        "write. It cannot enumerate every ungoverned edit: Zoho exposes no "
+        "per-field history and Modified_Time holds only the most recent "
+        "change. Read a 'diverged' verdict as 'at least one change here was "
+        "not governed, most recently at the time shown'.",
+        "Ledger coverage starts at %s, the earliest entry in the live chain. "
+        "The chain rotates and sealed archives are not read here."
+        % (covers_from or "never - the ledger is empty"),
+        "%d applied entries have no recorded post-write Modified_Time and "
+        "cannot be matched to a record's current state." % index["unmatchable"],
+        "%d refusals were recorded before refusals carried record ids and "
+        "cannot be attributed to any record."
+        % index.get("unattributed_refusals", 0),
+        "A record deleted or merged in the Zoho UI leaves nothing to poll.",
+        "Modified_By names the OAuth user for this module's own writes, so it "
+        "identifies a person only for changes the module did not make.",
+    ]
+
+    name = "custody_report" + time.strftime(".%Y%m%dT%H%M%SZ",
+                                            time.gmtime()) + ".json"
+    path = str(helpers.get("WS") or "").rstrip("/") + "/" + name
+    # Ids and timelines to the file, counts inline. redact_output strips
+    # identifiers out of a receipt, so a per-record verdict returned inline
+    # would come back as "[account]: diverged" and answer nobody's question.
+    helpers["jsave"](path, {
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "module_version": _module_version(),
+        "module": module,
+        "ledger_covers_from": covers_from,
+        "limits": limits,
+        "records": records,
+    })
+
+    summary = (
+        "%d %s record%s: %d governed, %d diverged, %d unproven%s. %d governed "
+        "changes, %d refusals and %d unresolved writes in their histories. Per "
+        "record detail is in %s. 'diverged' means at least one change was not "
+        "governed, most recently at the time shown - Zoho exposes no per-field "
+        "history, so it cannot be counted. 'unproven' is not a failure: it is "
+        "the ledger declining to claim coverage it does not have."
+        % (len(ids), module, "" if len(ids) == 1 else "s",
+           verdicts["governed"], verdicts["diverged"], verdicts["unproven"],
+           (" and %d unchecked" % verdicts["unchecked"])
+           if verdicts["unchecked"] else "",
+           totals["governed_changes"], totals["refusals"],
+           totals["unresolved"], name))
+
+    return {
+        "ok": True,
+        "module": module,
+        "records": len(ids),
+        "governed": verdicts["governed"],
+        "diverged": verdicts["diverged"],
+        "unproven": verdicts["unproven"],
+        "unchecked": verdicts["unchecked"],
+        "governed_changes": totals["governed_changes"],
+        "refusals": totals["refusals"],
+        "unresolved": totals["unresolved"],
+        "ledger_covers_from": covers_from,
+        "unmatchable_ledger_entries": index["unmatchable"],
+        "unattributed_refusals": index.get("unattributed_refusals", 0),
+        "report_path": path,
+        "covers": "detects that a record's current state was not produced by a "
+                  "governed write; it cannot enumerate every ungoverned edit, "
+                  "because Zoho exposes no per-field history",
+        "summary": summary,
+        "origin": _origin(stamp),
+    }, None
+
+
 # --- rollback ---------------------------------------------------------------
 #
 # The listing has always said the plan snapshot doubles as rollback data. It
@@ -3491,7 +3990,8 @@ def zoho_apply_rollback(inputs, stamp):
             "refused", "apply_rollback", module, key,
             {"reason": "state moved between plan and apply",
              "expected": expected, "actual": actual,
-             "records": len(ids)}))
+             "records": len(ids),
+             "targets": [str(i) for i in ids]}))
         raise RuntimeError(
             "Refusing to roll back. The records moved since the rollback plan "
             "was made: the state fingerprint is %s, not %s. Re-run "
