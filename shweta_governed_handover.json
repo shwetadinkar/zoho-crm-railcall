@@ -5,7 +5,7 @@
   "status": "CANVAS",
   "author": "shweta",
   "tag": "governed CRM",
-  "desc": "Somebody leaves the company. This workflow finds the changes nobody approved, reports everything the departing user owns across Leads, Deals, Contacts and Accounts, reassigns the whole book in one governed batch, and confirms the change is recorded in a tamper-evident ledger.\n\nIt opens with scan_changes because the ledger has an honest limit: it records changes made through this module only, so somebody editing directly in the Zoho UI is invisible to it. Modified_Time is not. The first step reads what actually moved and matches each change against the ledger on the exact post-write timestamp Zoho returned, naming the ones with no approval behind them. That is how you find out the leaver's records have been edited by hand before you move them - and the count is what makes the handover worth running now rather than later.\n\nThe point is still the middle. plan_handover fingerprints the exact set of records it is about to move. apply_handover re-reads that set, re-hashes it, and REFUSES if anything moved in between - so a record edited between review and execution stops the write rather than being silently swept up in it. A CRM has no undo, and this is the gap ordinary automation leaves open.\n\nEvery step produces a signed receipt, and the run carries an integrity root over all four nodes. The final step verifies the local change ledger, which is hash-chained: each entry carries the fingerprint of the one before it, so editing or removing an entry breaks every link after it.\n\nLive execution is OFF by default. Dry-run works anywhere; firing this workflow for real requires an operator to enable Studio DAG live runs under Studio -> Settings -> Live Execution. That toggle is the human gate on this path, and the setting is signed on save.\n\nHonest about limits: the ledger is tamper-EVIDENT, not tamper-proof. scan_changes narrows the UI-edit gap but does not close it - it finds ungoverned EDITS, and a record deleted or merged in the UI leaves nothing to poll. Its record ids go to a file, because receipts redact identifiers. Closed deals are excluded from a handover unless you ask for them.\n\nVerified end to end against a live Zoho org - 42 records moved and moved back, COMPLETED both directions, and the scan step verified on station v0.64 including the truncation case, where the station correctly refuses to advance its cursor past rows the module did not return.\n\nTrigger contract: supply from_user and to_user as email addresses of Zoho CRM users.\n\nDependencies: requires shweta/zoho-crm v0.9.1 or later, with the zoho vault entry configured (client_id, client_secret, refresh_token, token_url, instance_url). Run zoho.verify_connection first - it names any missing scope and which commands it blocks. [contest:2026Q3]",
+  "desc": "Somebody leaves the company. This workflow finds the changes nobody approved, reports everything the departing user owns across Leads, Deals, Contacts and Accounts, reassigns the whole book in one governed batch, and closes with per-record evidence of what actually happened.\n\nTHE PART NOBODY ELSE DOES. An offboarding is exactly when ungoverned edits matter most. In the days before somebody goes, their records may have been edited by hand - by them, by a manager, by an automation nobody remembers configuring - and then a bulk reassignment moves the whole book at once. scan_changes already finds changes with no approval behind them. plan_handover already finds what this person owns. Node 10 intersects the two: of the records about to be handed over, how many were edited outside the airlock? That number raises the approval tier at node 11. A clean book moves on a routine approval. A book that has been quietly edited gets escalated, because it should be. No other workflow can ask this, because no other module has scan_changes.\n\nSEVENTEEN NODES, FIVE OF THEM PURE LOGIC. Intake: verify_connection names any missing scope before a read is attempted; list_users runs with AllUsers so a leaver who is already deactivated is still visible; a transform then checks both users - both exist, the receiving user is active, they are not the same person - and refuses in pure logic rather than failing three nodes later. Review: scan_changes, plan_handover, then four read-only COQL reads, one per module, that fetch the leaver's book by owner. The join at node 10 is BY RECORD, on module and id, across all four modules - not by owner, and not on one module. Node 11 sets the tier, node 12 fails closed. Commit: apply_handover runs only if the guard passed. Evidence: reconcile_writes settles any write Zoho never confirmed, verify_ledger checks the chain, custody_report gives a per-record verdict, and a final transform decides whether the run may call itself finished.\n\nPLAN THEN APPLY. An approval binds to the inputs a human saw, not to the records they point at. plan_handover fingerprints the exact set it is about to move. apply_handover re-reads that set, re-hashes it, and REFUSES if anything moved in between - so a record edited between review and execution stops the write rather than being swept up in it. A CRM has no undo, and this is the gap ordinary automation leaves open.\n\nEvery step produces a signed receipt and the run carries an integrity root over all seventeen nodes. The change ledger is hash-chained: each entry carries the fingerprint of the one before it, so editing or removing an entry breaks every link after it.\n\nLive execution is OFF by default. Dry-run works anywhere; firing this workflow for real requires an operator to enable Studio DAG live runs under Studio -> Settings -> Live Execution. That toggle is the human gate on this path, and the setting is signed on save.\n\nHONEST LIMITS, ALL OF THEM. The approval tier at node 11 is REPORTED, NOT ENFORCED - the station is the approval authority, and reaching a real second approver needs team_approval and a mesh of separate approvers that a solo station cannot form. The risk join sees what scan_changes sees: ungoverned EDITS. A record deleted or merged in the Zoho UI leaves nothing to poll, so an overlap count of zero is not proof of a clean book. Scan coverage starts at the earliest entry in the live ledger chain; the chain rotates and sealed archives are not read. custody_report detects THAT a record diverged, not how many times, because Zoho exposes no per-field history. The ledger is tamper-EVIDENT, not tamper-proof. Record ids go to a file, because receipts redact identifiers. Closed deals are excluded from a handover unless you ask for them.\n\nEVIDENCE SCOPING, STATED RATHER THAN IMPLIED. The risk join at node 10 covers all four modules, because a one-module risk assessment would miss most of the book. The custody report at node 16 covers LEADS ONLY - custody_report takes one module per call and caps at 500 records. Contacts, Accounts and Deals are covered by the ledger check at node 15, which proves the chain is intact and that every write was recorded, but does not produce a per-record verdict for those three modules. Node 17 says so in its own output rather than reporting a clean run it cannot evidence.\n\nA KNOWN CONSTRAINT. plan_handover and apply_handover resolve both users against Zoho's ActiveConfirmedUsers list, so a leaver who has already been deactivated cannot currently be handed over - the two nodes will report the user as unmatched. Node 3 catches this in pure logic and names it, instead of surfacing it as a confusing failure at node 5. Handing over BEFORE deactivating the account works today.\n\nTrigger contract: supply from_user and to_user as email addresses of Zoho CRM users.\n\nDependencies: requires shweta/zoho-crm v0.9.1 or later, with the zoho vault entry configured (client_id, client_secret, refresh_token, token_url, instance_url). Run zoho.verify_connection first - it names any missing scope and which commands it blocks. [contest:2026Q3]",
   "trigger": "manual",
   "capabilities": {
     "providers": [
@@ -21,18 +21,115 @@
   },
   "steps": [
     {
-      "id": "scan",
-      "label": "Find the changes nobody approved",
-      "command_id": "shweta/zoho-crm.scan_changes",
+      "id": "preflight",
+      "label": "Check every scope this handover needs",
+      "command_id": "shweta/zoho-crm.verify_connection",
       "inputs_template": {}
     },
     {
+      "id": "resolve_users",
+      "label": "List every user, including deactivated ones",
+      "command_id": "shweta/zoho-crm.list_users",
+      "inputs_template": {
+        "type": "AllUsers"
+      }
+    },
+    {
+      "id": "validate_users",
+      "label": "Check both users before anything reads the CRM",
+      "transform": true,
+      "inputs_template": {
+        "users": "{{nodes.resolve_users._}}",
+        "from_user": "{{ctx.from_user}}",
+        "to_user": "{{ctx.to_user}}"
+      }
+    },
+    {
+      "id": "scan",
+      "label": "Find the changes nobody approved",
+      "command_id": "shweta/zoho-crm.scan_changes",
+      "inputs_template": {
+        "modules": [
+          "Leads",
+          "Contacts",
+          "Accounts",
+          "Deals"
+        ]
+      }
+    },
+    {
       "id": "plan",
-      "label": "Count everything one user owns",
+      "label": "Count everything the leaver owns",
       "command_id": "shweta/zoho-crm.plan_handover",
       "inputs_template": {
         "from_user": "{{ctx.from_user}}",
         "to_user": "{{ctx.to_user}}"
+      }
+    },
+    {
+      "id": "own_leads",
+      "label": "Read the leaver's Leads",
+      "command_id": "shweta/zoho-crm.search_records",
+      "inputs_template": {
+        "query": "select Owner, Modified_Time from Leads where Owner = '{{nodes.validate_users.from_id}}'"
+      }
+    },
+    {
+      "id": "own_contacts",
+      "label": "Read the leaver's Contacts",
+      "command_id": "shweta/zoho-crm.search_records",
+      "inputs_template": {
+        "query": "select Owner, Modified_Time from Contacts where Owner = '{{nodes.validate_users.from_id}}'"
+      }
+    },
+    {
+      "id": "own_accounts",
+      "label": "Read the leaver's Accounts",
+      "command_id": "shweta/zoho-crm.search_records",
+      "inputs_template": {
+        "query": "select Owner, Modified_Time from Accounts where Owner = '{{nodes.validate_users.from_id}}'"
+      }
+    },
+    {
+      "id": "own_deals",
+      "label": "Read the leaver's open Deals",
+      "command_id": "shweta/zoho-crm.search_records",
+      "inputs_template": {
+        "query": "select Owner, Modified_Time from Deals where Owner = '{{nodes.validate_users.from_id}}' and Stage not in ('Closed Won', 'Closed Lost', 'Closed-Lost to Competition')"
+      }
+    },
+    {
+      "id": "risk_join",
+      "label": "Which records being handed over were edited outside the airlock",
+      "transform": true,
+      "inputs_template": {
+        "scan": "{{nodes.scan._}}",
+        "plan": "{{nodes.plan._}}",
+        "leads": "{{nodes.own_leads._}}",
+        "contacts": "{{nodes.own_contacts._}}",
+        "accounts": "{{nodes.own_accounts._}}",
+        "deals": "{{nodes.own_deals._}}"
+      }
+    },
+    {
+      "id": "tier",
+      "label": "Approval tier from book size and ungoverned overlap",
+      "transform": true,
+      "inputs_template": {
+        "handover_size": "{{nodes.risk_join.handover_size}}",
+        "overlap_count": "{{nodes.risk_join.overlap_count}}",
+        "from_deactivated": "{{nodes.validate_users.from_deactivated}}"
+      }
+    },
+    {
+      "id": "guard",
+      "label": "Fail closed before any record moves",
+      "transform": true,
+      "inputs_template": {
+        "users_ok": "{{nodes.validate_users.ok}}",
+        "plan": "{{nodes.plan._}}",
+        "risk_ok": "{{nodes.risk_join.ok}}",
+        "level": "{{nodes.tier.level}}"
       }
     },
     {
@@ -45,13 +142,55 @@
       }
     },
     {
+      "id": "reconcile",
+      "label": "Settle any write Zoho never confirmed",
+      "command_id": "shweta/zoho-crm.reconcile_writes",
+      "inputs_template": {}
+    },
+    {
       "id": "verify",
       "label": "Check the change ledger has not been altered",
       "command_id": "shweta/zoho-crm.verify_ledger",
       "inputs_template": {}
+    },
+    {
+      "id": "custody",
+      "label": "Per-record custody verdict for the Leads that moved",
+      "command_id": "shweta/zoho-crm.custody_report",
+      "inputs_template": {
+        "module": "Leads",
+        "record_ids": "{{nodes.risk_join.leads_ids}}"
+      }
+    },
+    {
+      "id": "settle",
+      "label": "Is this run finished, or held?",
+      "transform": true,
+      "inputs_template": {
+        "guard_proceed": "{{nodes.guard.proceed}}",
+        "blocked": "{{nodes.guard.blocked_by}}",
+        "apply": "{{nodes.apply._}}",
+        "reconcile": "{{nodes.reconcile._}}",
+        "verify": "{{nodes.verify._}}",
+        "custody": "{{nodes.custody._}}"
+      }
     }
   ],
   "nodes": [
+    {
+      "id": "preflight",
+      "label": "Check every scope this handover needs",
+      "command_id": "shweta/zoho-crm.verify_connection"
+    },
+    {
+      "id": "resolve_users",
+      "label": "List every user, including deactivated ones",
+      "command_id": "shweta/zoho-crm.list_users"
+    },
+    {
+      "id": "validate_users",
+      "label": "Check both users before anything reads the CRM"
+    },
     {
       "id": "scan",
       "label": "Find the changes nobody approved",
@@ -59,8 +198,40 @@
     },
     {
       "id": "plan",
-      "label": "Count everything one user owns",
+      "label": "Count everything the leaver owns",
       "command_id": "shweta/zoho-crm.plan_handover"
+    },
+    {
+      "id": "own_leads",
+      "label": "Read the leaver's Leads",
+      "command_id": "shweta/zoho-crm.search_records"
+    },
+    {
+      "id": "own_contacts",
+      "label": "Read the leaver's Contacts",
+      "command_id": "shweta/zoho-crm.search_records"
+    },
+    {
+      "id": "own_accounts",
+      "label": "Read the leaver's Accounts",
+      "command_id": "shweta/zoho-crm.search_records"
+    },
+    {
+      "id": "own_deals",
+      "label": "Read the leaver's open Deals",
+      "command_id": "shweta/zoho-crm.search_records"
+    },
+    {
+      "id": "risk_join",
+      "label": "Which records being handed over were edited outside the airlock"
+    },
+    {
+      "id": "tier",
+      "label": "Approval tier from book size and ungoverned overlap"
+    },
+    {
+      "id": "guard",
+      "label": "Fail closed before any record moves"
     },
     {
       "id": "apply",
@@ -68,57 +239,248 @@
       "command_id": "shweta/zoho-crm.apply_handover"
     },
     {
+      "id": "reconcile",
+      "label": "Settle any write Zoho never confirmed",
+      "command_id": "shweta/zoho-crm.reconcile_writes"
+    },
+    {
       "id": "verify",
       "label": "Check the change ledger has not been altered",
       "command_id": "shweta/zoho-crm.verify_ledger"
+    },
+    {
+      "id": "custody",
+      "label": "Per-record custody verdict for the Leads that moved",
+      "command_id": "shweta/zoho-crm.custody_report"
+    },
+    {
+      "id": "settle",
+      "label": "Is this run finished, or held?"
     }
   ],
   "edges": [
+    {
+      "from": "preflight",
+      "to": "resolve_users"
+    },
+    {
+      "from": "resolve_users",
+      "to": "validate_users"
+    },
+    {
+      "from": "validate_users",
+      "to": "scan"
+    },
     {
       "from": "scan",
       "to": "plan"
     },
     {
       "from": "plan",
+      "to": "own_leads"
+    },
+    {
+      "from": "plan",
+      "to": "own_contacts"
+    },
+    {
+      "from": "plan",
+      "to": "own_accounts"
+    },
+    {
+      "from": "plan",
+      "to": "own_deals"
+    },
+    {
+      "from": "plan",
+      "to": "risk_join"
+    },
+    {
+      "from": "risk_join",
+      "to": "tier"
+    },
+    {
+      "from": "tier",
+      "to": "guard"
+    },
+    {
+      "from": "guard",
       "to": "apply"
     },
     {
       "from": "apply",
+      "to": "reconcile"
+    },
+    {
+      "from": "reconcile",
       "to": "verify"
+    },
+    {
+      "from": "verify",
+      "to": "custody"
+    },
+    {
+      "from": "guard",
+      "to": "settle"
+    },
+    {
+      "from": "own_leads",
+      "to": "risk_join"
+    },
+    {
+      "from": "own_contacts",
+      "to": "risk_join"
+    },
+    {
+      "from": "own_accounts",
+      "to": "risk_join"
+    },
+    {
+      "from": "own_deals",
+      "to": "risk_join"
     }
   ],
   "canvas_spec": {
     "nodes": [
       {
-        "id": "scan",
+        "id": "preflight",
         "type": "effect",
         "x": 80,
-        "y": 120,
-        "action_id": "zoho_scan_changes",
-        "action_title": "Report what changed since the last run, and which changes nobody approved",
+        "y": 250,
+        "action_title": "Check every scope this handover needs",
+        "action_id": "zoho_verify_connection",
         "provider": "zoho",
         "args": {}
+      },
+      {
+        "id": "resolve_users",
+        "type": "effect",
+        "x": 340,
+        "y": 250,
+        "action_title": "List every user, including deactivated ones",
+        "action_id": "zoho_list_users",
+        "provider": "zoho",
+        "args": {
+          "type": "AllUsers"
+        }
+      },
+      {
+        "id": "validate_users",
+        "type": "transform",
+        "x": 600,
+        "y": 250,
+        "action_title": "Check both users before anything reads the CRM",
+        "args": {}
+      },
+      {
+        "id": "scan",
+        "type": "effect",
+        "x": 860,
+        "y": 250,
+        "action_title": "Find the changes nobody approved",
+        "action_id": "zoho_scan_changes",
+        "provider": "zoho",
+        "args": {
+          "modules": [
+            "Leads",
+            "Contacts",
+            "Accounts",
+            "Deals"
+          ]
+        }
       },
       {
         "id": "plan",
         "type": "effect",
-        "x": 420,
-        "y": 120,
+        "x": 1120,
+        "y": 250,
+        "action_title": "Count everything the leaver owns",
         "action_id": "zoho_plan_handover",
-        "action_title": "Count everything one user owns, before moving any of it",
         "provider": "zoho",
         "args": {
           "from_user": "{{ctx.from_user}}",
           "to_user": "{{ctx.to_user}}"
         }
+      },
+      {
+        "id": "own_leads",
+        "type": "effect",
+        "x": 1380,
+        "y": 40,
+        "action_title": "Read the leaver's Leads",
+        "action_id": "zoho_search_records",
+        "provider": "zoho",
+        "args": {
+          "query": "select Owner, Modified_Time from Leads where Owner = '{{nodes.validate_users.from_id}}'"
+        }
+      },
+      {
+        "id": "own_contacts",
+        "type": "effect",
+        "x": 1380,
+        "y": 180,
+        "action_title": "Read the leaver's Contacts",
+        "action_id": "zoho_search_records",
+        "provider": "zoho",
+        "args": {
+          "query": "select Owner, Modified_Time from Contacts where Owner = '{{nodes.validate_users.from_id}}'"
+        }
+      },
+      {
+        "id": "own_accounts",
+        "type": "effect",
+        "x": 1380,
+        "y": 320,
+        "action_title": "Read the leaver's Accounts",
+        "action_id": "zoho_search_records",
+        "provider": "zoho",
+        "args": {
+          "query": "select Owner, Modified_Time from Accounts where Owner = '{{nodes.validate_users.from_id}}'"
+        }
+      },
+      {
+        "id": "own_deals",
+        "type": "effect",
+        "x": 1380,
+        "y": 460,
+        "action_title": "Read the leaver's open Deals",
+        "action_id": "zoho_search_records",
+        "provider": "zoho",
+        "args": {
+          "query": "select Owner, Modified_Time from Deals where Owner = '{{nodes.validate_users.from_id}}' and Stage not in ('Closed Won', 'Closed Lost', 'Closed-Lost to Competition')"
+        }
+      },
+      {
+        "id": "risk_join",
+        "type": "transform",
+        "x": 1660,
+        "y": 250,
+        "action_title": "Which records being handed over were edited outside the airlock",
+        "args": {}
+      },
+      {
+        "id": "tier",
+        "type": "transform",
+        "x": 1920,
+        "y": 250,
+        "action_title": "Approval tier from book size and ungoverned overlap",
+        "args": {}
+      },
+      {
+        "id": "guard",
+        "type": "transform",
+        "x": 2180,
+        "y": 250,
+        "action_title": "Fail closed before any record moves",
+        "args": {}
       },
       {
         "id": "apply",
         "type": "effect",
-        "x": 760,
-        "y": 120,
+        "x": 2440,
+        "y": 250,
+        "action_title": "Reassign the planned set, refusing on drift",
         "action_id": "zoho_apply_handover",
-        "action_title": "Reassign the planned set, refusing if anything has moved since",
         "provider": "zoho",
         "args": {
           "from_user": "{{ctx.from_user}}",
@@ -126,28 +488,127 @@
         }
       },
       {
+        "id": "reconcile",
+        "type": "effect",
+        "x": 2700,
+        "y": 250,
+        "action_title": "Settle any write Zoho never confirmed",
+        "action_id": "zoho_reconcile_writes",
+        "provider": "zoho",
+        "args": {}
+      },
+      {
         "id": "verify",
         "type": "effect",
-        "x": 1100,
-        "y": 120,
+        "x": 2960,
+        "y": 250,
+        "action_title": "Check the change ledger has not been altered",
         "action_id": "zoho_verify_ledger",
-        "action_title": "Check the local change ledger has not been altered",
         "provider": "zoho",
+        "args": {}
+      },
+      {
+        "id": "custody",
+        "type": "effect",
+        "x": 3220,
+        "y": 250,
+        "action_title": "Per-record custody verdict for the Leads that moved",
+        "action_id": "zoho_custody_report",
+        "provider": "zoho",
+        "args": {
+          "module": "Leads",
+          "record_ids": "{{nodes.risk_join.leads_ids}}"
+        }
+      },
+      {
+        "id": "settle",
+        "type": "transform",
+        "x": 3480,
+        "y": 250,
+        "action_title": "Is this run finished, or held?",
         "args": {}
       }
     ],
     "edges": [
+      {
+        "from": "preflight",
+        "to": "resolve_users"
+      },
+      {
+        "from": "resolve_users",
+        "to": "validate_users"
+      },
+      {
+        "from": "validate_users",
+        "to": "scan"
+      },
       {
         "from": "scan",
         "to": "plan"
       },
       {
         "from": "plan",
+        "to": "own_leads"
+      },
+      {
+        "from": "plan",
+        "to": "own_contacts"
+      },
+      {
+        "from": "plan",
+        "to": "own_accounts"
+      },
+      {
+        "from": "plan",
+        "to": "own_deals"
+      },
+      {
+        "from": "plan",
+        "to": "risk_join"
+      },
+      {
+        "from": "risk_join",
+        "to": "tier"
+      },
+      {
+        "from": "tier",
+        "to": "guard"
+      },
+      {
+        "from": "guard",
         "to": "apply"
       },
       {
         "from": "apply",
+        "to": "reconcile"
+      },
+      {
+        "from": "reconcile",
         "to": "verify"
+      },
+      {
+        "from": "verify",
+        "to": "custody"
+      },
+      {
+        "from": "guard",
+        "to": "settle"
+      },
+      {
+        "from": "own_leads",
+        "to": "risk_join"
+      },
+      {
+        "from": "own_contacts",
+        "to": "risk_join"
+      },
+      {
+        "from": "own_accounts",
+        "to": "risk_join"
+      },
+      {
+        "from": "own_deals",
+        "to": "risk_join"
       }
     ]
   },
@@ -160,12 +621,51 @@
     },
     "nodes": [
       {
+        "id": "preflight",
+        "type": "effect",
+        "branch": "intake",
+        "action_id": "zoho_verify_connection",
+        "provider": "zoho",
+        "args": {}
+      },
+      {
+        "id": "resolve_users",
+        "type": "effect",
+        "branch": "intake",
+        "parent": "preflight",
+        "action_id": "zoho_list_users",
+        "provider": "zoho",
+        "args": {
+          "type": "AllUsers"
+        }
+      },
+      {
+        "id": "validate_users",
+        "type": "transform",
+        "branch": "intake",
+        "parent": "resolve_users",
+        "input_from": {
+          "users": "{{nodes.resolve_users._}}",
+          "from_user": "{{ctx.from_user}}",
+          "to_user": "{{ctx.to_user}}"
+        },
+        "code": "# Node 3. Pure logic, so a bad user pair is caught before any effect node runs.\n# A live run of the 4-node workflow failed at plan_handover with \"No active\n# user matches ...\" - a good error that arrived after two nodes had executed.\n#\n# Tolerates None everywhere: at plan time no effect node has stored an output,\n# so `users` arrives as None and every field below resolves to a miss.\nsrc = input.get(\"users\") or {}\nrows = src.get(\"users\") or []\nwant_from = str(input.get(\"from_user\") or \"\").strip().lower()\nwant_to = str(input.get(\"to_user\") or \"\").strip().lower()\nproblems = []\n\ndef pick(want):\n    if not want:\n        return None\n    hits = []\n    for u in rows:\n        if not isinstance(u, dict):\n            continue\n        if want == str(u.get(\"id\") or \"\").strip().lower():\n            return u\n        email = str(u.get(\"email\") or \"\").strip().lower()\n        name = str(u.get(\"full_name\") or \"\").strip().lower()\n        if want == email or want == name:\n            hits.append(u)\n    if len(hits) == 1:\n        return hits[0]\n    return None\n\nleaver = pick(want_from)\ntaker = pick(want_to)\n\nif not want_from:\n    problems.append(\"ctx.from_user is empty\")\nelif leaver is None:\n    problems.append(\"from_user \" + want_from + \" matches no user, or matches more than one\")\nif not want_to:\n    problems.append(\"ctx.to_user is empty\")\nelif taker is None:\n    problems.append(\"to_user \" + want_to + \" matches no user, or matches more than one\")\n\nfrom_status = str((leaver or {}).get(\"status\") or \"\").strip().lower()\nto_status = str((taker or {}).get(\"status\") or \"\").strip().lower()\n\n# The RECEIVING user must be active. Handing a book to a deactivated user\n# would leave it owned by nobody who can work it, which is the condition\n# hygiene_scan reports as orphaned.\nif taker is not None and to_status != \"active\":\n    problems.append(\"to_user is not active (status \" + (to_status or \"unknown\") + \")\")\n\n# The DEPARTING user being deactivated is the normal case for an offboarding,\n# so it is a finding, not a failure. It is also a sharper risk signal: a\n# deactivated owner whose records are still being edited is worse than an\n# active one. Node 11 reads from_deactivated for exactly that.\nfrom_deactivated = leaver is not None and from_status != \"active\"\n\nsame_user = (leaver is not None and taker is not None\n             and str(leaver.get(\"id\")) == str(taker.get(\"id\")))\nif same_user:\n    problems.append(\"from_user and to_user are the same person\")\n\noutput = {\n    \"ok\": not problems,\n    \"problems\": problems,\n    \"from_found\": leaver is not None,\n    \"to_found\": taker is not None,\n    \"from_id\": str((leaver or {}).get(\"id\") or \"\"),\n    \"to_id\": str((taker or {}).get(\"id\") or \"\"),\n    \"from_name\": (leaver or {}).get(\"full_name\"),\n    \"to_name\": (taker or {}).get(\"full_name\"),\n    \"from_status\": from_status or \"unknown\",\n    \"to_status\": to_status or \"unknown\",\n    \"from_deactivated\": from_deactivated,\n    \"same_user\": same_user,\n    \"users_seen\": len(rows),\n}"
+      },
+      {
         "id": "scan",
         "type": "effect",
         "branch": "review",
+        "parent": "validate_users",
         "action_id": "zoho_scan_changes",
         "provider": "zoho",
-        "args": {}
+        "args": {
+          "modules": [
+            "Leads",
+            "Contacts",
+            "Accounts",
+            "Deals"
+          ]
+        }
       },
       {
         "id": "plan",
@@ -180,10 +680,99 @@
         }
       },
       {
+        "id": "own_leads",
+        "type": "effect",
+        "branch": "review",
+        "parent": "plan",
+        "cond": "{{nodes.validate_users.ok}}",
+        "action_id": "zoho_search_records",
+        "provider": "zoho",
+        "args": {
+          "query": "select Owner, Modified_Time from Leads where Owner = '{{nodes.validate_users.from_id}}'"
+        }
+      },
+      {
+        "id": "own_contacts",
+        "type": "effect",
+        "branch": "review",
+        "parent": "plan",
+        "cond": "{{nodes.validate_users.ok}}",
+        "action_id": "zoho_search_records",
+        "provider": "zoho",
+        "args": {
+          "query": "select Owner, Modified_Time from Contacts where Owner = '{{nodes.validate_users.from_id}}'"
+        }
+      },
+      {
+        "id": "own_accounts",
+        "type": "effect",
+        "branch": "review",
+        "parent": "plan",
+        "cond": "{{nodes.validate_users.ok}}",
+        "action_id": "zoho_search_records",
+        "provider": "zoho",
+        "args": {
+          "query": "select Owner, Modified_Time from Accounts where Owner = '{{nodes.validate_users.from_id}}'"
+        }
+      },
+      {
+        "id": "own_deals",
+        "type": "effect",
+        "branch": "review",
+        "parent": "plan",
+        "cond": "{{nodes.validate_users.ok}}",
+        "action_id": "zoho_search_records",
+        "provider": "zoho",
+        "args": {
+          "query": "select Owner, Modified_Time from Deals where Owner = '{{nodes.validate_users.from_id}}' and Stage not in ('Closed Won', 'Closed Lost', 'Closed-Lost to Competition')"
+        }
+      },
+      {
+        "id": "risk_join",
+        "type": "transform",
+        "branch": "review",
+        "parent": "plan",
+        "input_from": {
+          "scan": "{{nodes.scan._}}",
+          "plan": "{{nodes.plan._}}",
+          "leads": "{{nodes.own_leads._}}",
+          "contacts": "{{nodes.own_contacts._}}",
+          "accounts": "{{nodes.own_accounts._}}",
+          "deals": "{{nodes.own_deals._}}"
+        },
+        "code": "# Node 10 - the centrepiece. Of the records about to be handed over, how many\n# were edited outside the airlock? Nothing else on the marketplace can ask\n# this, because nothing else has scan_changes.\n#\n# THE JOIN IS BY RECORD, NOT BY OWNER. plan_handover returns counts only - no\n# ids - so the leaver's book comes from four read-only COQL nodes instead, one\n# per module, using the same \"Owner = <id>\" filter plan_handover itself uses.\n# An owner-based join was the alternative and it is not available either:\n# scan_changes puts modified_by in its report FILE, not in changes[], and a\n# transform cannot read files.\n#\n# Effect outputs are flattened by the engine - every list and dict is dropped,\n# only scalars survive as top-level keys - so each source is bound as\n# {{nodes.X._}} and indexed here.\nscan = input.get(\"scan\") or {}\nplan = input.get(\"plan\") or {}\nchanges = scan.get(\"changes\") or []\n\nbook = {}\nfor module, blob in ((\"Leads\", input.get(\"leads\")),\n                     (\"Contacts\", input.get(\"contacts\")),\n                     (\"Accounts\", input.get(\"accounts\")),\n                     (\"Deals\", input.get(\"deals\"))):\n    ids = []\n    for row in ((blob or {}).get(\"records\") or []):\n        if isinstance(row, dict) and row.get(\"id\"):\n            ids.append(str(row[\"id\"]))\n    book[module] = ids\n\nbook_size = 0\nfor module in book:\n    book_size = book_size + len(book[module])\n\noverlap = []\nper_module = {}\nscan_total = 0\nfor row in changes:\n    if not isinstance(row, dict):\n        continue\n    scan_total = scan_total + 1\n    if row.get(\"governed\"):\n        continue\n    module = str(row.get(\"module\") or \"\")\n    rid = str(row.get(\"id\") or \"\")\n    if not rid or rid not in (book.get(module) or []):\n        continue\n    per_module[module] = (per_module.get(module) or 0) + 1\n    overlap.append({\n        \"module\": module,\n        \"id\": rid,\n        \"modified_at\": row.get(\"modified_at\"),\n        \"change_ref\": row.get(\"change_ref\"),\n    })\n\nproblems = []\nif not changes and scan.get(\"count\"):\n    problems.append(\"scan reported changes but none reached this node\")\nif book_size == 0:\n    problems.append(\"no records read for the leaver in any module\")\n\n# custody_report caps at 500 records per call and takes one module, so node 16\n# reports on Leads only. Node 15 covers the rest of the run through the ledger.\nleads_ids = (book.get(\"Leads\") or [])[:500]\n\noutput = {\n    \"ok\": not problems,\n    \"problems\": problems,\n    \"overlap_count\": len(overlap),\n    \"overlap\": overlap[:200],\n    \"per_module\": per_module,\n    \"handover_size\": plan.get(\"total\") or 0,\n    \"book_size\": book_size,\n    \"scan_total\": scan_total,\n    \"leads_ids\": leads_ids,\n    \"leads_count\": len(leads_ids),\n    \"basis\": \"joined by record on module and id: the leaver's book read live \"\n             \"by COQL, intersected with the ungoverned rows scan_changes \"\n             \"returned. Ungoverned EDITS only - a record deleted or merged in \"\n             \"the Zoho UI leaves nothing to poll, so zero overlap is not proof \"\n             \"of a clean book.\",\n}"
+      },
+      {
+        "id": "tier",
+        "type": "transform",
+        "branch": "review",
+        "parent": "risk_join",
+        "input_from": {
+          "handover_size": "{{nodes.risk_join.handover_size}}",
+          "overlap_count": "{{nodes.risk_join.overlap_count}}",
+          "from_deactivated": "{{nodes.validate_users.from_deactivated}}"
+        },
+        "code": "# Node 11. Reports a tier. Does NOT enforce one - see below.\n#\n# Thresholds, written down rather than left as magic numbers:\n#   LARGE_BOOK  a reassignment of more than this many records is no longer a\n#               routine change; it is most of somebody's portfolio moving at\n#               once, and the blast radius of getting the wrong to_user is the\n#               whole set.\n#   Any ungoverned overlap AT ALL escalates. One record edited outside the\n#   airlock in the days before an offboarding is the signal this workflow\n#   exists to surface; a threshold above zero would hide exactly the case\n#   that matters.\nLARGE_BOOK = 100\n\nsize = input.get(\"handover_size\") or 0\noverlap = input.get(\"overlap_count\") or 0\nfrom_deactivated = bool(input.get(\"from_deactivated\"))\nbig = size > LARGE_BOOK\nreasons = []\n\nif big:\n    reasons.append(\"book of \" + str(size) + \" records is over the \" + str(LARGE_BOOK) + \"-record routine threshold\")\nif overlap:\n    reasons.append(str(overlap) + \" record(s) in this handover were changed with no approval behind them\")\nif from_deactivated and overlap:\n    reasons.append(\"the departing user is already deactivated, so those edits were not theirs\")\n\nif big and overlap:\n    level = \"dual_control\"\nelif big or overlap:\n    level = \"elevated\"\nelse:\n    level = \"routine\"\n    reasons.append(\"no ungoverned overlap and a book under \" + str(LARGE_BOOK) + \" records\")\n\noutput = {\n    \"level\": level,\n    \"reasons\": reasons,\n    \"requires_second_approver\": level == \"dual_control\",\n    \"large_book_threshold\": LARGE_BOOK,\n    \"enforced\": False,\n    \"authority\": \"REPORTED, NOT ENFORCED. The station is the approval \"\n                 \"authority; reaching a real second approver needs team_approval \"\n                 \"and a mesh of separate approvers, which a solo station cannot \"\n                 \"form. This node raises the tier an operator should apply. It \"\n                 \"cannot make the station demand it.\",\n}"
+      },
+      {
+        "id": "guard",
+        "type": "transform",
+        "branch": "review",
+        "parent": "tier",
+        "input_from": {
+          "users_ok": "{{nodes.validate_users.ok}}",
+          "plan": "{{nodes.plan._}}",
+          "risk_ok": "{{nodes.risk_join.ok}}",
+          "level": "{{nodes.tier.level}}"
+        },
+        "code": "# Node 12. The last pure check before anything is written. Fails closed:\n# every unknown is a block, never a pass.\nblocked_by = []\n\nif not input.get(\"users_ok\"):\n    blocked_by.append(\"user validation did not pass\")\n\nplan = input.get(\"plan\") or {}\nif not plan.get(\"ok\"):\n    blocked_by.append(\"no plan output to act on\")\nelif not plan.get(\"total\"):\n    blocked_by.append(\"the plan matched no records\")\n\nif not input.get(\"risk_ok\"):\n    blocked_by.append(\"the risk join did not complete\")\n\nlevel = input.get(\"level\")\nif level not in (\"routine\", \"elevated\", \"dual_control\"):\n    blocked_by.append(\"approval tier is missing or unrecognised (\" + str(level) + \")\")\n\n# plan_handover fingerprints the set internally and apply_handover re-reads and\n# re-hashes it, refusing on drift. The fingerprint is not in the plan OUTPUT,\n# so this node cannot check it - the module enforces that itself, at apply.\noutput = {\n    \"proceed\": not blocked_by,\n    \"blocked_by\": blocked_by,\n    \"drift_check\": \"enforced inside apply_handover, not here - the plan \"\n                   \"fingerprint is not exposed in the plan output\",\n}"
+      },
+      {
         "id": "apply",
         "type": "effect",
         "branch": "commit",
-        "parent": "plan",
+        "parent": "guard",
+        "cond": "{{nodes.guard.proceed}}",
         "action_id": "zoho_apply_handover",
         "provider": "zoho",
         "args": {
@@ -192,15 +781,51 @@
         }
       },
       {
-        "id": "verify",
+        "id": "reconcile",
         "type": "effect",
         "branch": "evidence",
         "parent": "apply",
+        "action_id": "zoho_reconcile_writes",
+        "provider": "zoho",
+        "args": {}
+      },
+      {
+        "id": "verify",
+        "type": "effect",
+        "branch": "evidence",
+        "parent": "reconcile",
         "action_id": "zoho_verify_ledger",
         "provider": "zoho",
         "args": {}
+      },
+      {
+        "id": "custody",
+        "type": "effect",
+        "branch": "evidence",
+        "parent": "verify",
+        "action_id": "zoho_custody_report",
+        "provider": "zoho",
+        "args": {
+          "module": "Leads",
+          "record_ids": "{{nodes.risk_join.leads_ids}}"
+        }
+      },
+      {
+        "id": "settle",
+        "type": "transform",
+        "branch": "evidence",
+        "parent": "guard",
+        "input_from": {
+          "guard_proceed": "{{nodes.guard.proceed}}",
+          "blocked": "{{nodes.guard.blocked_by}}",
+          "apply": "{{nodes.apply._}}",
+          "reconcile": "{{nodes.reconcile._}}",
+          "verify": "{{nodes.verify._}}",
+          "custody": "{{nodes.custody._}}"
+        },
+        "code": "# Node 17. The run refusing to call itself finished while something is\n# unaccounted for - the module's own refusal behaviour, at the run level.\n#\n# Parented to `guard` rather than to the evidence chain on purpose. A skipped\n# node's children are skipped too, so parenting this to `custody` would mean\n# the one node whose job is to report \"held, and here is why\" never runs on\n# precisely the runs that were held. Every binding below can therefore be None.\nheld = []\n\nif not input.get(\"guard_proceed\"):\n    for reason in (input.get(\"blocked\") or [\"the guard blocked this run\"]):\n        held.append(str(reason))\n\napplied = input.get(\"apply\") or {}\nreconcile = input.get(\"reconcile\") or {}\nverify = input.get(\"verify\") or {}\ncustody = input.get(\"custody\") or {}\n\nif applied.get(\"ok\"):\n    if applied.get(\"failed\"):\n        held.append(str(applied.get(\"failed\")) + \" reassignment(s) were rejected by Zoho\")\n\n    if not reconcile.get(\"ok\"):\n        held.append(\"reconcile_writes did not report\")\n    elif reconcile.get(\"unknown\"):\n        held.append(str(reconcile.get(\"unknown\")) + \" write(s) still have an outcome nobody can determine\")\n\n    if not verify.get(\"ok\"):\n        held.append(\"verify_ledger did not report\")\n    elif not verify.get(\"intact\"):\n        held.append(\"the ledger chain is broken at entry \" + str(verify.get(\"first_broken_entry\")))\n\n    if not custody.get(\"ok\"):\n        held.append(\"custody_report did not report\")\n    elif custody.get(\"diverged\"):\n        held.append(str(custody.get(\"diverged\")) + \" Leads record(s) came back diverged after the handover\")\n\nsettled = not held\nif settled and not applied.get(\"ok\"):\n    settled = False\n    held.append(\"no handover was applied in this run\")\n\nif settled:\n    summary = (\"Settled. \" + str(applied.get(\"moved\") or 0) + \" records moved, \"\n               \"ledger chain intact, every write accounted for, no Leads record diverged.\")\nelse:\n    summary = \"Held: \" + \"; \".join(held)\n\noutput = {\n    \"settled\": settled,\n    \"held_because\": held,\n    \"summary\": summary,\n    \"covers\": \"settlement is judged over what this run can see: reconcile \"\n              \"verdicts, the ledger chain, and custody verdicts for Leads. \"\n              \"Contacts, Accounts and Deals are covered by the ledger check \"\n              \"only.\",\n}"
       }
     ]
   },
-  "version": "1.1.0"
+  "version": "1.2.0"
 }
