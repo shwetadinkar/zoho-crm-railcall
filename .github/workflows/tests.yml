@@ -51,3 +51,89 @@ jobs:
               print("\n".join(bad)); sys.exit(1)
           print("manifest ok: %d commands" % len(m["commands"]))
           PY
+      - name: Stated counts must match the manifest
+        run: |
+          python3 - <<'PY'
+          import json, re, sys
+
+          ONES = ["one", "two", "three", "four", "five", "six", "seven", "eight", "nine"]
+          TEENS = ["ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen",
+                   "sixteen", "seventeen", "eighteen", "nineteen"]
+          TENS = ["twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety"]
+
+          WORDS = {}
+          for i, w in enumerate(ONES):
+              WORDS[w] = i + 1
+          for i, w in enumerate(TEENS):
+              WORDS[w] = i + 10
+          for i, t in enumerate(TENS):
+              WORDS[t] = (i + 2) * 10
+              for j, o in enumerate(ONES):
+                  WORDS["%s-%s" % (t, o)] = (i + 2) * 10 + j + 1
+
+          TOKENS = sorted(WORDS, key=len, reverse=True)
+          NUM = r"(?:\d+|%s)" % "|".join(TOKENS)
+
+
+          def value(tok):
+              tok = tok.lower()
+              return int(tok) if tok.isdigit() else WORDS[tok]
+
+
+          m = json.load(open("module.json"))
+          cmds = m["commands"]
+          truth = {
+              "command": len(cmds),
+              "read": len([c for c in cmds if c.get("mode") == "read"]),
+              "write": len([c for c in cmds if c.get("mode") != "read"]),
+          }
+
+          SOURCES = [
+              ("module.json description", m["description"]),
+              ("README.md", open("README.md").read()),
+              ("COMMANDS.md", open("COMMANDS.md").read()),
+          ]
+
+          # Only a number that OPENS a sentence is an inventory claim. "in one command"
+          # and "the two commands whose whole purpose" are prose, not counts.
+          OPENS = r"(?:^|(?<=\. )|(?<=: )|(?<=\*\*))"
+          STATED = re.compile(OPENS + r"(%s)[ \n]+(command|read|write)s?\b" % NUM, re.I | re.M)
+          OF_THE = re.compile(r"\b(%s)[ \n]+of[ \n]+the[ \n]+(%s)\b" % (NUM, NUM), re.I)
+
+          bad = []
+          for name, text in SOURCES:
+              seen = set()
+              for tok, noun in STATED.findall(text):
+                  got, want = value(tok), truth[noun.lower()]
+                  seen.add(noun.lower())
+                  if got != want:
+                      bad.append("%s: says %s %ss, manifest has %d"
+                                 % (name, tok, noun.lower(), want))
+              # "twenty-nine of the thirty-one" - the second number is a total claim.
+              for first, second in OF_THE.findall(text):
+                  a, b = value(first), value(second)
+                  if b != truth["command"]:
+                      bad.append("%s: says '%s of the %s', manifest has %d commands"
+                                 % (name, first, second, truth["command"]))
+                  elif a > b:
+                      bad.append("%s: says '%s of the %s', which is more than all of them"
+                                 % (name, first, second))
+              if "command" not in seen:
+                  bad.append("%s: states no command count at all - the check has nothing "
+                             "to hold it to, so restore the sentence" % name)
+
+          # Every command must also be documented, one section each.
+          doc = open("COMMANDS.md").read()
+          documented = set(re.findall(r"^## (zoho\.\S+)[^\S\n]*$", doc, re.M))
+          declared = set(c["id"] for c in cmds)
+          for cid in sorted(declared - documented):
+              bad.append("COMMANDS.md: no '## %s' section" % cid)
+          for cid in sorted(documented - declared):
+              bad.append("COMMANDS.md: documents '%s', which the manifest does not declare" % cid)
+
+          if bad:
+              print("\n".join(bad))
+              sys.exit(1)
+          print("counts ok: %d commands, %d read, %d write - agreed by module.json, "
+                "README.md and COMMANDS.md" % (truth["command"], truth["read"], truth["write"]))
+          PY
