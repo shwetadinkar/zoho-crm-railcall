@@ -38,6 +38,28 @@ TIMEOUT = 30
 # retrying it duplicates the record.
 _NON_IDEMPOTENT = {"POST", "PUT", "DELETE"}
 
+
+class ZohoUnresolvedWrite(RuntimeError):
+    """A write whose outcome cannot be determined.
+
+    Raised when a write gets no HTTP status at all, or a 5xx. Zoho has no
+    idempotency key, so the module cannot retry and cannot ask afterwards
+    whether the request landed. The three possibilities - applied, not
+    applied, partially applied - are all live.
+
+    A subclass of RuntimeError deliberately: every existing caller that
+    catches RuntimeError keeps working unchanged. Only the apply paths, which
+    have the plan key and the target ids in scope, catch this specifically to
+    record what was attempted before re-raising.
+
+    CAUTION for anyone adding a catch site: _NON_IDEMPOTENT includes POST, and
+    COQL reads are POSTs, so _coql_capped and _read_by_ids raise this too. It
+    means "a non-idempotent request got no verdict", not "a write was made".
+    Catch it around the write call alone, never around a block that also reads,
+    or a failed pre-flight read gets filed as an unresolved write.
+    """
+
+
 # v8 makes `fields` mandatory on record reads. These are the sensible defaults;
 # anything not listed falls back to asking the metadata API.
 _DEFAULT_FIELDS = {
@@ -196,6 +218,11 @@ def _call(method, path, params=None, body=None):
     always safe. 5xx on a write might have committed, and with no idempotency
     key a retry duplicates, so reads retry and writes don't. Any other 4xx is a
     settled answer and retrying it just wastes five round trips.
+
+    The two unknown-outcome branches raise ZohoUnresolvedWrite rather than
+    a bare RuntimeError, so an apply path can record what it attempted. The
+    429 and 4xx branches deliberately do not: a 429 is a settled refusal and
+    a 4xx is a settled answer, and neither leaves the outcome in doubt.
     """
     helpers = __rc_helpers__  # noqa: F821
     label = "%s %s" % (method, path)
@@ -226,7 +253,7 @@ def _call(method, path, params=None, body=None):
 
         if status is None:
             if not idempotent:
-                raise RuntimeError(
+                raise ZohoUnresolvedWrite(
                     "Network error during %s. This is a write so it was not "
                     "retried; the request may already have been applied. Check "
                     "Zoho before running it again. Underlying error: %s"
@@ -250,7 +277,7 @@ def _call(method, path, params=None, body=None):
 
         if 500 <= status < 600:
             if not idempotent:
-                raise RuntimeError(
+                raise ZohoUnresolvedWrite(
                     "Zoho returned HTTP %s on %s. This is a write and Zoho has no "
                     "idempotency key, so it was not retried; the change may have "
                     "been applied. Verify in Zoho before re-approving."
@@ -910,8 +937,22 @@ def zoho_apply_update(inputs, stamp):
         record.update(changes)
         payload.append(record)
 
-    result = _summarise(_call("PUT", module, body={"data": payload}),
-                        "apply plan to " + module, stamp)
+    # Only the write is inside the try. _read_by_ids above is a COQL POST and
+    # POST is in _NON_IDEMPOTENT, so a pre-flight read that gets no verdict
+    # raises ZohoUnresolvedWrite too - widening this block would file a failed
+    # read as a write that might have landed.
+    try:
+        result = _summarise(_call("PUT", module, body={"data": payload}),
+                            "apply plan to " + module, stamp)
+    except ZohoUnresolvedWrite as exc:
+        raise _ledger_unresolved(
+            exc, "apply_update", module, _plan_key(module, query, changes),
+            {"intent": changes, "fields": fields,
+             "targets": [{"id": r["id"],
+                          "before": {f: r["before"].get(f) for f in fields},
+                          "before_modified_time":
+                              r["before"].get("Modified_Time")}
+                         for r in snapshot]})
     result["fingerprint_verified"] = expected
     result["records_applied"] = len(payload)
     entry = _ledger_append(_ledger_note(
@@ -994,8 +1035,25 @@ def zoho_apply_delete(inputs, stamp):
             "now match and the state fingerprint no longer agrees. Re-run "
             "zoho.plan_delete and review the new set." % len(snapshot))
 
-    response = _call("DELETE", module,
-                     params={"ids": ",".join(r["id"] for r in snapshot)})
+    try:
+        response = _call("DELETE", module,
+                         params={"ids": ",".join(r["id"] for r in snapshot)})
+    except ZohoUnresolvedWrite as exc:
+        # A delete sets no value, so there is nothing for a later read to
+        # compare against: for these targets "landed" means the record is gone.
+        # Said explicitly rather than left to be inferred from the command name.
+        # Note this is the only ledger entry apply_delete writes at all - a
+        # successful delete is still unrecorded, which is a real gap, not
+        # something this change introduced.
+        raise _ledger_unresolved(
+            exc, "apply_delete", module,
+            _plan_key("delete:" + module, query, {}),
+            {"intent": None, "verdict_basis": "existence",
+             "fields": list(_DELETE_GUARD_FIELDS),
+             "targets": [{"id": r["id"], "before": r["before"],
+                          "before_modified_time":
+                              r["before"].get("Modified_Time")}
+                         for r in snapshot]})
     result = _summarise(response, "apply delete plan to " + module, stamp)
     result["records_deleted"] = len(snapshot)
     return result, None
@@ -1043,7 +1101,7 @@ def _owned_query(module, user_id, include_closed):
     if module == "Deals" and not include_closed:
         stages = ", ".join("'%s'" % s for s in _CLOSED_STAGES)
         where += " and Stage not in (%s)" % stages
-    return "select Owner from %s where %s" % (module, where)
+    return "select Owner, Modified_Time from %s where %s" % (module, where)
 
 
 def _resolve_user(users, who, label):
@@ -1068,13 +1126,24 @@ def _resolve_user(users, who, label):
 
 
 def _handover_scan(module_names, from_id, include_closed):
-    """Per-module id lists for everything the leaver owns."""
-    found = {}
+    """Per-module id lists for everything the leaver owns, and when each row
+    was last modified.
+
+    Returns (found, before_times): {module: [id]} and {module: {id: mtime}}.
+
+    The timestamps are free - the scan reads every row anyway - and they are
+    the only "before" an unresolved reassignment can be given. Read afterwards
+    they would prove nothing, because the write that got no verdict may be
+    exactly what moved them.
+    """
+    found, before_times = {}, {}
     for module in module_names:
         rows = _coql_all(_owned_query(module, from_id, include_closed),
                          label="ownership scan on " + module)
         found[module] = [str(r.get("id")) for r in rows if r.get("id")]
-    return found
+        before_times[module] = {str(r.get("id")): r.get("Modified_Time")
+                                for r in rows if r.get("id")}
+    return found, before_times
 
 
 def _handover_fingerprint(found):
@@ -1432,7 +1501,7 @@ def zoho_apply_merge(inputs, stamp):
          "archive": archive}))
 
     merged, failed = [], []
-    for rid in loser_ids:
+    for index, rid in enumerate(loser_ids):
         # One loser at a time so a partial failure is legible: with a single
         # batched call, a failure halfway through leaves no way to say which
         # records were merged and which were not.
@@ -1445,6 +1514,29 @@ def zoho_apply_merge(inputs, stamp):
                 merged.append(rid)
             else:
                 failed.append({"id": rid, "response": rows[0] if rows else response})
+        except ZohoUnresolvedWrite as exc:
+            # Ordered before the catch-all below, which would otherwise swallow
+            # this into `failed` and carry on. It must not carry on: after a
+            # merge that returned no verdict the master's state is unknown, and
+            # merging further losers into a possibly half-merged master is the
+            # kind of confident-looking wrong answer this module exists to
+            # avoid. The remaining losers are recorded as not attempted, so
+            # nothing about them is left ambiguous either.
+            #
+            # `archive_seq` points at the entry written before the merge fired,
+            # which holds the losers' full values. It is the only readable copy
+            # if the merge did in fact land.
+            raise _ledger_unresolved(
+                exc, "apply_merge", module, key,
+                {"intent": None, "verdict_basis": "existence",
+                 "master_id": master_id,
+                 "archive_seq": entry["seq"],
+                 "merged_before_failure": list(merged),
+                 "attempted": rid,
+                 "not_attempted": loser_ids[index + 1:],
+                 "targets": ([{"id": master_id, "role": "master"}]
+                             + [{"id": lid, "role": "loser"}
+                                for lid in loser_ids])})
         except Exception as e:                                  # noqa: BLE001
             failed.append({"id": rid, "error": str(e)[:200]})
 
@@ -1664,7 +1756,7 @@ def zoho_apply_upsert(inputs, stamp):
 
     ids = list(stored.get("update_ids") or [])
     current = _read_by_ids(module, ids, ["Modified_Time"]) if ids else []
-    actual, _snapshot = _fingerprint(module, current, ["Modified_Time"])
+    actual, snapshot = _fingerprint(module, current, ["Modified_Time"])
     expected = str(stored.get("fingerprint") or "")
 
     if actual != expected:
@@ -1687,7 +1779,36 @@ def zoho_apply_upsert(inputs, stamp):
     for start in range(0, len(records), _UPSERT_CALL):
         batch = records[start:start + _UPSERT_CALL]
         body = {"data": batch, "duplicate_check_fields": fields}
-        response = _call("POST", "%s/upsert" % module, body=body)
+        try:
+            response = _call("POST", "%s/upsert" % module, body=body)
+        except ZohoUnresolvedWrite as exc:
+            # Two gaps this entry has to state rather than paper over.
+            #
+            # Only the update half is reconcilable: a record about to be
+            # created has no id and no prior state, so there is nothing to
+            # re-read and nothing to compare. The create count is recorded so
+            # a reader sees the gap instead of reading `targets` as the whole
+            # batch.
+            #
+            # And the plan only ever fingerprinted Modified_Time on the
+            # existing records - it never read their field values - so a later
+            # check can tell that a record moved but not what it moved to.
+            # Hence verdict_basis, and hence recording the batch index: the
+            # batches before this one committed, and re-checking them would be
+            # noise at best and a wrong verdict at worst.
+            raise _ledger_unresolved(
+                exc, "apply_upsert", module, key,
+                {"intent": None, "verdict_basis": "modified_time",
+                 "fields": fields,
+                 "batch_index": start // _UPSERT_CALL,
+                 "batch_size": len(batch),
+                 "succeeded_before_failure": succeeded,
+                 "written_before_failure": list(written),
+                 "creates_unreconcilable": stored.get("creates"),
+                 "targets": [{"id": r["id"], "before": r["before"],
+                              "before_modified_time":
+                                  r["before"].get("Modified_Time")}
+                             for r in snapshot]})
         for row in (response.get("data") or []):
             if (row or {}).get("code") == "SUCCESS":
                 succeeded += 1
@@ -2178,7 +2299,8 @@ def zoho_plan_handover(inputs, stamp):
     include_closed = closed == "include"
 
     module_names = _handover_modules(inputs)
-    found = _handover_scan(module_names, str(leaver["id"]), include_closed)
+    found, _before = _handover_scan(module_names, str(leaver["id"]),
+                                    include_closed)
     total = sum(len(v) for v in found.values())
     if not total:
         raise RuntimeError("%s owns nothing in %s, so there is nothing to hand "
@@ -2187,7 +2309,7 @@ def zoho_plan_handover(inputs, stamp):
 
     excluded = 0
     if "Deals" in module_names and not include_closed:
-        every = _handover_scan(["Deals"], str(leaver["id"]), True)["Deals"]
+        every = _handover_scan(["Deals"], str(leaver["id"]), True)[0]["Deals"]
         excluded = max(0, len(every) - len(found.get("Deals", [])))
 
     fingerprint = _handover_fingerprint(found)
@@ -2239,7 +2361,8 @@ def zoho_apply_handover(inputs, stamp):
             "review what it reports, then apply with the same inputs. Plans "
             "expire after %d minutes." % (_PLAN_TTL // 60))
 
-    found = _handover_scan(module_names, str(leaver["id"]), closed == "include")
+    found, before_times = _handover_scan(module_names, str(leaver["id"]),
+                                         closed == "include")
     if _handover_fingerprint(found) != stored.get("fingerprint"):
         now = {m: len(v) for m, v in found.items()}
         raise RuntimeError(
@@ -2248,14 +2371,45 @@ def zoho_apply_handover(inputs, stamp):
             % (leaver.get("full_name"), now, stored.get("found")))
 
     owner = {"Owner": {"id": str(taker["id"])}}
+    handover_key = _plan_key("handover",
+                             str(leaver["id"]) + ">" + str(taker["id"]),
+                             {"modules": module_names, "closed": closed})
     moved, failed, errors = 0, 0, []
+    done = {}
     for module, ids in found.items():
         for start in range(0, len(ids), 100):
             batch = ids[start:start + 100]
             if not batch:
                 continue
             payload = [dict(owner, id=rid) for rid in batch]
-            result = _call("PUT", module, body={"data": payload})
+            try:
+                result = _call("PUT", module, body={"data": payload})
+            except ZohoUnresolvedWrite as exc:
+                # A handover is many writes, not one, so the entry has to say
+                # where in the sequence it stopped. `modules_completed` and
+                # `moved_before_failure` are what already committed; the
+                # targets are this batch alone, because those are the only
+                # records whose fate is actually in doubt.
+                #
+                # The entry's module is the one being written when it failed,
+                # not "handover" - anything joining the ledger to a record
+                # matches on module and id.
+                raise _ledger_unresolved(
+                    exc, "apply_handover", module, handover_key,
+                    {"intent": dict(owner), "fields": ["Owner"],
+                     "from_user": str(leaver["id"]),
+                     "to_user": str(taker["id"]),
+                     "batch_index": start // 100,
+                     "modules_completed": dict(done),
+                     "moved_before_failure": moved,
+                     "not_attempted": {m: len(v) for m, v in found.items()
+                                       if m not in done and m != module},
+                     "targets": [
+                         {"id": rid,
+                          "before": {"Owner": str(leaver["id"])},
+                          "before_modified_time":
+                              (before_times.get(module) or {}).get(rid)}
+                         for rid in batch]})
             for row in result.get("data", []) or []:
                 if row.get("code") == "SUCCESS":
                     moved += 1
@@ -2263,6 +2417,7 @@ def zoho_apply_handover(inputs, stamp):
                     failed += 1
                     errors.append({"module": module, "code": row.get("code"),
                                    "message": row.get("message")})
+        done[module] = len(ids)
 
     if moved == 0 and failed:
         raise RuntimeError("Zoho rejected every reassignment. First error: %s"
@@ -2520,6 +2675,51 @@ def _ledger_note(outcome, command, module, key, detail):
             "plan_key": key, "detail": detail}
 
 
+def _ledger_unresolved(exc, command, module, key, detail):
+    """Record a write whose outcome Zoho never confirmed, and hand back the
+    exception the caller should raise.
+
+    The module already reasoned correctly about an unresolved write and then
+    discarded the reasoning: the operator was told to go and check, and
+    whatever they found left no trace. This keeps it.
+
+    Returns the replacement exception instead of raising it, so a call site
+    reads `raise _ledger_unresolved(...)` and the raise stays visible where
+    it happens rather than hiding inside a helper.
+
+    `attempted_at` is this module's own UTC clock, which is a lower bound
+    and not Zoho's clock: the two differ by the request's flight time.
+    Anything comparing it against a Modified_Time has to read it as "no
+    earlier than", or a write that landed just before a timeout reads as one
+    that never did.
+
+    Two conventions these entries follow, so a later reader can rely on them:
+
+    `intent` is entry-level when every target was being set to the same
+    thing, and null at entry level when it differs per record - a target then
+    carries its own `intent` (rollback does this).
+
+    `verdict_basis` says how the outcome can be established at all. "value"
+    means compare the recorded fields against what the record holds now.
+    "existence" means there is no value to compare and the question is
+    whether the record is still there - delete and merge. "modified_time"
+    means the prior values were never read, so only movement can be judged,
+    not what it moved to - upsert. Getting this wrong is how a reconciler
+    reports a confident verdict it has no basis for.
+    """
+    body = dict(detail)
+    body["reason"] = str(exc)
+    body["attempted_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    body.setdefault("verdict_basis", "value")
+    entry = _ledger_append(_ledger_note("unresolved", command, module, key,
+                                        body))
+    return ZohoUnresolvedWrite(
+        "%s The attempt is recorded as ledger entry %d, holding the prior "
+        "values and each record's Modified_Time from just before the call, "
+        "so what happened can be established by re-reading those records."
+        % (exc, entry["seq"]))
+
+
 # --- ledger commands --------------------------------------------------------
 
 def zoho_verify_ledger(inputs, stamp):
@@ -2532,11 +2732,24 @@ def zoho_verify_ledger(inputs, stamp):
     book = _ledger_load()
     applied = sum(1 for e in book["entries"] if e.get("outcome") == "applied")
     refused = sum(1 for e in book["entries"] if e.get("outcome") == "refused")
+    unresolved = sum(1 for e in book["entries"]
+                     if e.get("outcome") == "unresolved")
 
     if intact:
-        summary = ("Ledger intact. %d entries verified, %d applied and %d "
-                   "refused. Tamper-evident, not tamper-proof: this proves no "
-                   "entry was altered in place." % (checked, applied, refused))
+        summary = ("Ledger intact. %d entries verified, %d applied, %d refused "
+                   "and %d unresolved. Tamper-evident, not tamper-proof: this "
+                   "proves no entry was altered in place."
+                   % (checked, applied, refused, unresolved))
+        if unresolved:
+            # Counted separately rather than folded into applied, because that
+            # is the whole point: Zoho never said whether these landed, and a
+            # summary that guessed either way would be the fake-green this
+            # module exists to avoid.
+            summary += (" The %d unresolved %s a write Zoho never returned a "
+                        "verdict on; the entry holds what was attempted and "
+                        "the prior values, so it can be checked by hand."
+                        % (unresolved,
+                           "entry is" if unresolved == 1 else "entries are each"))
     else:
         summary = ("Ledger BROKEN at entry %d. The %d entries before it verify; "
                    "entry %d and everything after it cannot be trusted."
@@ -2549,8 +2762,11 @@ def zoho_verify_ledger(inputs, stamp):
         "first_broken_entry": bad,
         "applied": applied,
         "refused": refused,
+        "unresolved": unresolved,
         "covers": "changes made through this module only; edits made in the "
-                  "Zoho UI are not visible here",
+                  "Zoho UI are not visible here. An unresolved entry records a "
+                  "write whose outcome Zoho never confirmed - it is neither an "
+                  "applied change nor a refused one",
         "summary": summary,
         "origin": _origin(stamp),
     }, None
@@ -2572,9 +2788,9 @@ def zoho_audit_pack(inputs, stamp):
     until = str(inputs.get("until", "")).strip()
     module = str(inputs.get("module", "")).strip()
     outcome = str(inputs.get("outcome", "")).strip().lower()
-    if outcome and outcome not in ("applied", "refused"):
-        raise RuntimeError("'outcome' must be 'applied' or 'refused' if given, "
-                           "got %r." % outcome)
+    if outcome and outcome not in ("applied", "refused", "unresolved"):
+        raise RuntimeError("'outcome' must be 'applied', 'refused' or "
+                           "'unresolved' if given, got %r." % outcome)
 
     intact, checked, bad = _ledger_verify()
     book = _ledger_load()
@@ -2601,11 +2817,19 @@ def zoho_audit_pack(inputs, stamp):
                   "first_broken_entry": bad,
                   "chain_start": book["chain_start"]},
         "scope_note": ("Records changes made through shweta/zoho-crm. Edits "
-                       "made directly in the Zoho UI are not represented."),
+                       "made directly in the Zoho UI are not represented. An "
+                       "entry with outcome 'unresolved' is a write Zoho never "
+                       "returned a verdict on: it may have landed, may not, "
+                       "and may have landed for some of its targets only."),
         "counts": {
             "entries": len(rows),
             "applied": sum(1 for r in rows if r.get("outcome") == "applied"),
             "refused": sum(1 for r in rows if r.get("outcome") == "refused"),
+            "unresolved": sum(1 for r in rows
+                              if r.get("outcome") == "unresolved"),
+            # Deliberately counts applied entries only. An unresolved entry has
+            # targets but no known outcome, so adding its records here would
+            # claim changes that may never have happened.
             "records_changed": sum(int(r.get("detail", {}).get("records") or 0)
                                    for r in rows if r.get("outcome") == "applied"),
         },
@@ -2622,13 +2846,17 @@ def zoho_audit_pack(inputs, stamp):
         "entries": pack["counts"]["entries"],
         "applied": pack["counts"]["applied"],
         "refused": pack["counts"]["refused"],
+        "unresolved": pack["counts"]["unresolved"],
         "records_changed": pack["counts"]["records_changed"],
         "chain_intact": intact,
         "summary": ("Wrote %d ledger entries to %s - %d applied, %d refused, "
-                    "%d records changed. Chain %s. Refusals are the useful half: "
-                    "they are the evidence the control fired."
+                    "%d unresolved, %d records changed. Chain %s. Refusals are "
+                    "the useful half: they are the evidence the control fired. "
+                    "The unresolved count is writes Zoho never confirmed either "
+                    "way, and is not included in records changed."
                     % (pack["counts"]["entries"], name,
                        pack["counts"]["applied"], pack["counts"]["refused"],
+                       pack["counts"]["unresolved"],
                        pack["counts"]["records_changed"],
                        "intact" if intact else "BROKEN at entry %d" % bad)),
         "origin": _origin(stamp),
@@ -2770,7 +2998,7 @@ def zoho_apply_rollback(inputs, stamp):
                            "per write." % len(ids))
 
     current = _read_by_ids(module, ids, guard)
-    actual, _snapshot = _fingerprint(module, current, guard)
+    actual, snapshot = _fingerprint(module, current, guard)
     expected = str(stored.get("fingerprint") or "")
 
     if actual != expected:
@@ -2791,8 +3019,23 @@ def zoho_apply_rollback(inputs, stamp):
         record.update(row.get("restore_to") or {})
         payload.append(record)
 
-    result = _summarise(_call("PUT", module, body={"data": payload}),
-                        "roll back " + module, stamp)
+    before_by_id = {r["id"]: r["before"] for r in snapshot}
+    try:
+        result = _summarise(_call("PUT", module, body={"data": payload}),
+                            "roll back " + module, stamp)
+    except ZohoUnresolvedWrite as exc:
+        # Every record is restored to its own prior values, so there is no one
+        # intent for the entry - each target carries its own.
+        raise _ledger_unresolved(
+            exc, "apply_rollback", module, key,
+            {"intent": None, "fields": fields,
+             "targets": [{"id": row["id"],
+                          "intent": row.get("restore_to") or {},
+                          "before": {f: before_by_id.get(row["id"], {}).get(f)
+                                     for f in fields},
+                          "before_modified_time":
+                              before_by_id.get(row["id"], {}).get("Modified_Time")}
+                         for row in stored["records"] if row.get("id")]})
     result["fingerprint_verified"] = expected
     result["records_restored"] = len(payload)
 

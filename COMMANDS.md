@@ -791,12 +791,34 @@ No inputs.
   "first_broken_entry": null,
   "applied": 11,
   "refused": 3,
-  "covers": "changes made through this module only; edits made in the Zoho UI are not visible here",
-  "summary": "Ledger intact. 14 entries verified, 11 applied and 3 refused. Tamper-evident, not tamper-proof: this proves no entry was altered in place."
+  "unresolved": 1,
+  "covers": "changes made through this module only; edits made in the Zoho UI are not visible here. An unresolved entry records a write whose outcome Zoho never confirmed - it is neither an applied change nor a refused one",
+  "summary": "Ledger intact. 15 entries verified, 11 applied, 3 refused and 1 unresolved. Tamper-evident, not tamper-proof: this proves no entry was altered in place. The 1 unresolved entry is a write Zoho never returned a verdict on; the entry holds what was attempted and the prior values, so it can be checked by hand."
 }
 ```
 
-**Two honest limits, both stated in the output rather than only here.**
+### The three outcome classes
+
+`applied` and `refused` are settled: the change happened, or the module stopped
+it. `unresolved` is the third case, and it is not a failure.
+
+Zoho has no idempotency key. When a write returns no HTTP status at all, or a
+5xx, there is no way to retry it safely and no way to ask afterwards whether it
+landed - applied, not applied, and partially applied are all still live. The
+module has always refused to retry and told you to go and check. Now it also
+records what it attempted before it lost contact: the intended values, the
+records in the payload, each one's prior values, and each one's `Modified_Time`
+from immediately before the call.
+
+That last field is the useful one. An untouched `Modified_Time` on a record you
+re-read afterwards is near proof the write never landed, and it is the only
+signal strong enough to tell "nothing happened" apart from "it happened and was
+changed back".
+
+An unresolved entry never counts towards `records_changed`. Nothing is known to
+have changed.
+
+**Three honest limits, all stated in the output rather than only here.**
 
 It is *tamper-evident*, not tamper-proof. It proves no entry was altered in
 place. Anyone who can write the file can rewrite the whole chain from any point.
@@ -805,10 +827,15 @@ It covers changes made *through this module*. Someone editing in the Zoho UI is
 invisible to it. It is a record of governed changes, not an audit trail of the
 org.
 
+An unresolved entry records an *attempt*, not an outcome. Reading one tells you
+what the module tried to do and what the records looked like beforehand. It does
+not tell you what happened, and nothing in this module will claim otherwise.
+
 ## zoho.audit_pack
 
 Writes the ledger out as a file for review, and returns the path and the counts.
-Read-only.
+Read-only. Covers all three outcome classes - see verify_ledger above for what
+`unresolved` means.
 
 The contents are not returned inline. Receipts redact identifiers, so anything
 returned in the output would come back with its record ids stripped, which is
@@ -819,7 +846,7 @@ precisely what makes a pack worth reading. A human opens the file.
 | `since` | string | no | ISO date or datetime; omit for everything |
 | `until` | string | no | ISO date or datetime; omit for everything |
 | `module` | string | no | restrict to one module api_name |
-| `outcome` | string | no | `applied` or `refused`; omit for both |
+| `outcome` | string | no | `applied`, `refused` or `unresolved`; omit for all three |
 
 ```json
 { "since": "2026-07-01", "outcome": "refused" }
@@ -832,15 +859,30 @@ precisely what makes a pack worth reading. A human opens the file.
   "entries": 3,
   "applied": 0,
   "refused": 3,
+  "unresolved": 0,
   "records_changed": 0,
   "chain_intact": true,
-  "summary": "Wrote 3 ledger entries to audit_pack.20260801T071029Z.json - 0 applied, 3 refused, 0 records changed. Chain intact. Refusals are the useful half: they are the evidence the control fired."
+  "summary": "Wrote 3 ledger entries to audit_pack.20260801T071029Z.json - 0 applied, 3 refused, 0 unresolved, 0 records changed. Chain intact. Refusals are the useful half: they are the evidence the control fired. The unresolved count is writes Zoho never confirmed either way, and is not included in records changed."
 }
 ```
 
 Each entry in the file holds the outcome, command, module, timestamp, the two
 fingerprints where they differ, and the chain hashes. Applied entries also carry
 the prior values.
+
+An unresolved entry carries `reason` (Zoho's failure as the module saw it),
+`attempted_at`, `intent`, and a `targets` list holding each record's id, its
+prior values, and its `before_modified_time`. It also carries `verdict_basis`,
+which says how the outcome could be established at all: `value` means compare
+the recorded fields against what the record holds now; `existence` means there
+is no value to compare and the question is whether the record still exists
+(delete, merge); `modified_time` means the prior values were never read, so only
+movement can be judged, not what it moved to (upsert).
+
+Where a command writes in batches - `apply_upsert` and `apply_handover` - the
+entry also records how far it got before contact was lost, so the batches that
+definitely committed are not re-examined alongside the one that is genuinely in
+doubt.
 
 `entries_verified` in the file's `chain` block counts the *whole* ledger, not the
 filtered subset, because integrity is a property of the chain rather than of your
@@ -1213,7 +1255,12 @@ reasons are in `errors`.
 
 **"was not retried"** - a write that hit a 5xx or a dropped connection is not
 retried, because Zoho has no idempotency header and a retried create leaves a
-duplicate. Check Zoho, then re-approve.
+duplicate. Check Zoho, then re-approve. The message also names a ledger entry:
+the attempt is recorded with the intended values, the records in the payload,
+and each one's `Modified_Time` from just before the call. Open it with
+`zoho.audit_pack --outcome unresolved` before you go looking - a record whose
+`Modified_Time` still matches the recorded one was almost certainly not
+written.
 
 **"No current plan"** - apply must repeat the planned inputs exactly. Plans
 expire after 60 minutes.
@@ -1323,8 +1370,22 @@ old file under a timestamped name and starting a fresh chain from the last
 sealed hash. Ledger entries hold record ids and prior field values, so the file
 is personal data and lives in the station workspace beside the plans.
 
-Ledger writes happen after the API call, not before. A write that lands and is
-then followed by a failed ledger write is real and unrecorded. The alternative
-would be recording changes that never happened, which is worse for an evidence
-file. The ledger does not claim completeness; it claims not to lie about what it
+Ledger writes happen after the API call, not before, with one deliberate
+exception: `apply_merge` archives the losing records first, because after the
+merge there is no readable copy left anywhere. A write that lands and is then
+followed by a failed ledger write is real and unrecorded. The alternative would
+be recording changes that never happened, which is worse for an evidence file.
+The ledger does not claim completeness; it claims not to lie about what it
 holds.
+
+An `unresolved` entry is the one case where the ledger records something that
+may not have happened, and it is explicit about it: the outcome class says so,
+the entry holds an attempt rather than a change, and its records are excluded
+from every "changed" count. Recording nothing was the old behaviour and it was
+worse - the module knew exactly what it had tried to do and threw that away at
+the moment it became most useful.
+
+`apply_delete` and `apply_handover` write a ledger entry only in this
+unresolved case. A successful delete or handover is not yet recorded, so
+`scan_changes` reports both as ungoverned. That is a real gap in coverage, named
+here rather than left to be discovered.

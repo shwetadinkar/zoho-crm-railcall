@@ -2138,6 +2138,400 @@ def t_scan_changes_orders_ascending():
     m.zoho_scan_changes({"modules": ["Leads"]}, {})
     assert "order by Modified_Time asc" in seen["q"], seen["q"]
 
+
+
+# ------------------------------------------------- unresolved writes (0.9.0)
+#
+# A write that got no verdict is a third outcome, not a failed one. Everything
+# below checks the module keeps what it already knew instead of discarding it.
+
+_UNRESOLVED_BODY = b'{"message":"boom"}'
+
+
+def _failing_put(status=500):
+    """A PUT that answers 5xx, which _call must treat as unresolved."""
+    return lambda url, obj, hdrs: (status, _UNRESOLVED_BODY)
+
+
+def _unresolved_update_env():
+    """plan_update stored, then an apply whose PUT comes back 500."""
+    matched = [{"id": "1"}]
+    rows = [{"id": "1", "S": "old", "Modified_Time": "t1"}]
+    h, _calls, store = _ledger_helpers(matched, rows)
+    m = load(h)
+    m._put = _failing_put()
+    args = {"module": "Leads", "query": "select id from Leads where x = 1",
+            "changes": {"S": "new"}}
+    m.zoho_plan_update(args, {})
+    return m, args, store
+
+
+def _entries(store):
+    """Ledger entries, or none if the file was never written - "no entry at
+    all" is the assertion in several of these tests."""
+    return (store.get("/tmp/rc-test/zoho_ledger.json") or {}).get("entries", [])
+
+
+def t_unresolved_write_is_recorded_in_the_ledger():
+    m, args, store = _unresolved_update_env()
+    try:
+        m.zoho_apply_update(args, {})
+        assert False, "should have raised"
+    except m.ZohoUnresolvedWrite:
+        pass
+
+    entries = _entries(store)
+    assert len(entries) == 1, entries
+    entry = entries[0]
+    assert entry["outcome"] == "unresolved", entry
+    assert entry["command"] == "apply_update", entry
+    detail = entry["detail"]
+    assert detail["intent"] == {"S": "new"}, detail
+    assert detail["fields"] == ["S"], detail
+    assert detail["verdict_basis"] == "value", detail
+    assert detail["attempted_at"].endswith("Z"), detail
+    assert "not retried" in detail["reason"].lower(), detail
+    assert detail["targets"] == [
+        {"id": "1", "before": {"S": "old"}, "before_modified_time": "t1"}
+    ], detail["targets"]
+
+
+def t_unresolved_write_still_raises():
+    """The command must not return a normal result. A caller that got one
+    would report a change it has no idea happened."""
+    m, args, _store = _unresolved_update_env()
+    returned = []
+    try:
+        returned.append(m.zoho_apply_update(args, {}))
+    except m.ZohoUnresolvedWrite:
+        pass
+    assert not returned, returned
+
+
+def t_unresolved_error_names_the_ledger_entry():
+    m, args, store = _unresolved_update_env()
+    try:
+        m.zoho_apply_update(args, {})
+        assert False
+    except m.ZohoUnresolvedWrite as e:
+        seq = _entries(store)[0]["seq"]
+        assert "ledger entry %d" % seq in str(e), e
+        # the original diagnosis has to survive the wrapping
+        assert "may have been applied" in str(e), e
+
+
+def t_unresolved_is_a_runtime_error():
+    """Every existing caller catches RuntimeError. None of them may change
+    behaviour because a subclass was introduced."""
+    m, args, _store = _unresolved_update_env()
+    caught = None
+    try:
+        m.zoho_apply_update(args, {})
+    except RuntimeError as e:
+        caught = e
+    assert caught is not None, "plain except RuntimeError missed it"
+    assert isinstance(caught, m.ZohoUnresolvedWrite), type(caught)
+
+
+def t_a_settled_4xx_is_not_unresolved():
+    """A 400 is Zoho's answer, not the absence of one: plain RuntimeError and
+    nothing in the ledger."""
+    matched = [{"id": "1"}]
+    rows = [{"id": "1", "S": "old", "Modified_Time": "t1"}]
+    h, _calls, store = _ledger_helpers(matched, rows)
+    m = load(h)
+    m._put = _failing_put(400)
+    args = {"module": "Leads", "query": "select id from Leads where x = 1",
+            "changes": {"S": "new"}}
+    m.zoho_plan_update(args, {})
+    try:
+        m.zoho_apply_update(args, {})
+        assert False, "should have raised"
+    except RuntimeError as e:
+        assert not isinstance(e, m.ZohoUnresolvedWrite), e
+    assert _entries(store) == [], _entries(store)
+
+
+def t_a_failed_read_is_not_recorded_as_a_write():
+    """COQL reads are POSTs, and POST is non-idempotent, so a read that gets no
+    status raises ZohoUnresolvedWrite too. The apply must not file that as an
+    attempted write - only the write call itself is inside the try."""
+    matched = [{"id": "1"}]
+    rows = [{"id": "1", "S": "old", "Modified_Time": "t1"}]
+    h, _calls, store = _ledger_helpers(matched, rows)
+    m = load(h)
+    args = {"module": "Leads", "query": "select id from Leads where x = 1",
+            "changes": {"S": "new"}}
+    m.zoho_plan_update(args, {})
+
+    wrote = []
+    m._put = lambda url, obj, hdrs: (wrote.append(url), (200, b"{}"))[1]
+
+    # Fail the id lookup specifically - the read immediately before the write,
+    # and the one a too-wide try would swallow. The query-matching read earlier
+    # in the command is served normally, so this is not just "any read fails".
+    inner = h["http_post_json"]
+
+    def _post(url, obj, **k):
+        if " in (" in (obj or {}).get("select_query", ""):
+            raise OSError("simulated network failure")
+        return inner(url, obj, **k)
+
+    h["http_post_json"] = _post
+    try:
+        m.zoho_apply_update(args, {})
+        assert False, "should have raised"
+    except RuntimeError:
+        pass
+    assert not wrote, "a write was issued after the pre-flight read failed"
+    assert _entries(store) == [], _entries(store)
+
+
+def t_unresolved_entry_keeps_the_chain_verifiable():
+    m, args, store = _unresolved_update_env()
+    try:
+        m.zoho_apply_update(args, {})
+    except m.ZohoUnresolvedWrite:
+        pass
+    intact, checked, bad = m._ledger_verify()
+    assert intact and checked == 1 and bad is None, (intact, checked, bad)
+
+
+def t_verify_ledger_counts_unresolved():
+    h, _, _ = _ledger_helpers([], [])
+    m = load(h)
+    m._ledger_append(m._ledger_note("applied", "apply_update", "Leads", "a", {}))
+    m._ledger_append(m._ledger_note("refused", "apply_update", "Leads", "b", {}))
+    m._ledger_append(m._ledger_note("unresolved", "apply_update", "Leads", "c", {}))
+    out, err = m.zoho_verify_ledger({}, {})
+    assert err is None
+    assert out["applied"] == 1 and out["refused"] == 1, out
+    assert out["unresolved"] == 1, out
+    assert "1 unresolved" in out["summary"], out["summary"]
+    assert "never returned a verdict" in out["summary"], out["summary"]
+    assert "unresolved" in out["covers"], out["covers"]
+
+
+def t_audit_pack_accepts_the_unresolved_filter():
+    h, _, _ = _ledger_helpers([], [])
+    m = load(h)
+    m._ledger_append(m._ledger_note("applied", "apply_update", "Leads", "a",
+                                    {"records": 3}))
+    m._ledger_append(m._ledger_note("unresolved", "apply_update", "Leads", "b",
+                                    {"records": 2}))
+    out, _ = m.zoho_audit_pack({"outcome": "unresolved"}, {})
+    assert out["entries"] == 1 and out["unresolved"] == 1, out
+    # an unresolved entry's records are not known to have changed
+    assert out["records_changed"] == 0, out
+    both, _ = m.zoho_audit_pack({}, {})
+    assert both["records_changed"] == 3, both
+    assert both["unresolved"] == 1, both
+    try:
+        m.zoho_audit_pack({"outcome": "maybe"}, {})
+        assert False
+    except RuntimeError as e:
+        assert "unresolved" in str(e), e
+
+
+def t_unresolved_delete_records_an_existence_basis():
+    """A delete sets no value, so the only later question is whether the
+    record is gone. The entry has to say that rather than imply a comparison."""
+    seq = [([{"id": "1"}], False), ([{"id": "1", "Modified_Time": "t1"}], False),
+           ([{"id": "1"}], False), ([{"id": "1", "Modified_Time": "t1"}], False)]
+    store = {}
+
+    def _post(url, obj, **k):
+        rows, more = seq.pop(0) if seq else ([], False)
+        return 200, json.dumps({"data": rows, "info": {"more_records": more}}).encode()
+
+    h = {"oauth_refresh": lambda p, **k: {"access_token": "t", "instance_url": "https://x"},
+         "http_get_json": lambda u, **k: (200, b"{}"), "http_post_json": _post,
+         "http_delete_json": lambda u, **k: (500, _UNRESOLVED_BODY),
+         "WS": "/tmp/rc-test",
+         "jload": lambda path, default=None: store.get(path, default if default is not None else {}),
+         "jsave": lambda path, obj: store.__setitem__(path, obj)}
+    m = load(h)
+    args = {"module": "Leads", "query": "select id from Leads where x = 1"}
+    m.zoho_plan_delete(args, {})
+    try:
+        m.zoho_apply_delete(args, {})
+        assert False, "should have raised"
+    except m.ZohoUnresolvedWrite:
+        pass
+
+    entry = _entries(store)[0]
+    assert entry["outcome"] == "unresolved", entry
+    assert entry["command"] == "apply_delete", entry
+    assert entry["detail"]["verdict_basis"] == "existence", entry["detail"]
+    assert entry["detail"]["intent"] is None, entry["detail"]
+    assert entry["detail"]["targets"][0]["before_modified_time"] == "t1", entry
+
+
+def t_unresolved_rollback_records_intent_per_target():
+    """Each record is restored to its own prior values, so a single entry-level
+    intent would be wrong for all but one of them."""
+    matched = [{"id": "1"}]
+    h, _, store = _ledger_helpers(matched, [{"id": "1", "S": "old",
+                                             "Modified_Time": "t1"}])
+    m = _load_put(h)
+    args = {"module": "Leads", "query": "select id from Leads where x = 1",
+            "changes": {"S": "new"}}
+    m.zoho_plan_update(args, {})
+    m.zoho_apply_update(args, {})
+
+    after = [{"id": "1", "S": "new", "Modified_Time": "t2"}]
+    h2, _, _ = _ledger_helpers(matched, after, store=store)
+    m2 = _load_put(h2)
+    m2.zoho_plan_rollback(args, {})
+
+    h3, _, _ = _ledger_helpers(matched, after, store=store)
+    m3 = load(h3)
+    m3._put = _failing_put()
+    try:
+        m3.zoho_apply_rollback(args, {})
+        assert False, "should have raised"
+    except m3.ZohoUnresolvedWrite:
+        pass
+
+    entry = _entries(store)[-1]
+    assert entry["outcome"] == "unresolved", entry
+    assert entry["command"] == "apply_rollback", entry
+    detail = entry["detail"]
+    assert detail["intent"] is None, detail
+    target = detail["targets"][0]
+    assert target["intent"] == {"S": "old"}, target
+    assert target["before"] == {"S": "new"}, target
+    assert target["before_modified_time"] == "t2", target
+
+
+def t_unresolved_upsert_names_the_batch_and_its_gaps():
+    """250 records is three calls. If the second one gets no verdict, the
+    entry has to say which batch, what already committed, and that the creates
+    cannot be reconciled at all."""
+    recs = [{"Email": "u%d@x.com" % i} for i in range(250)]
+    args = {"module": "Leads", "records": recs,
+            "duplicate_check_fields": ["Email"]}
+    existing = [{"id": "1", "Email": "u0@x.com", "Modified_Time": "t1"}]
+    h, _calls, store = _upsert_helpers(existing)
+    m = load(h)
+    m.zoho_plan_upsert(args, {})
+
+    inner = h["http_post_json"]
+    seen = {"n": 0}
+
+    def _post(url, obj, **k):
+        if url.endswith("/upsert"):
+            seen["n"] += 1
+            if seen["n"] == 2:
+                return 500, _UNRESOLVED_BODY
+        return inner(url, obj, **k)
+
+    h["http_post_json"] = _post
+    try:
+        m.zoho_apply_upsert(args, {})
+        assert False, "should have raised"
+    except m.ZohoUnresolvedWrite:
+        pass
+
+    entry = _entries(store)[-1]
+    assert entry["outcome"] == "unresolved", entry
+    assert entry["command"] == "apply_upsert", entry
+    detail = entry["detail"]
+    assert detail["batch_index"] == 1, detail
+    assert detail["batch_size"] == 100, detail
+    assert detail["succeeded_before_failure"] == 100, detail
+    assert len(detail["written_before_failure"]) == 100, detail
+    # the plan only ever fingerprinted Modified_Time on existing records
+    assert detail["verdict_basis"] == "modified_time", detail
+    assert detail["creates_unreconcilable"] == 249, detail
+    assert detail["targets"] == [
+        {"id": "1", "before": {"Modified_Time": "t1"},
+         "before_modified_time": "t1"}], detail["targets"]
+
+
+def t_unresolved_handover_records_the_owner_before_the_write():
+    """The ownership scan is the only chance to capture Modified_Time. Read
+    after a write that got no verdict it would prove nothing."""
+    plan_scans = [[{"id": "1", "Modified_Time": "t1"}], [], [], [], []]
+    apply_scans = [[{"id": "1", "Modified_Time": "t1"}], [], [], []]
+    m, _calls = _handover_env(
+        USERS, plan_scans + apply_scans,
+        put=lambda u, o, h: (500, _UNRESOLVED_BODY))
+    args = {"from_user": "100", "to_user": "200"}
+    m.zoho_plan_handover(args, {})
+    try:
+        m.zoho_apply_handover(args, {})
+        assert False, "should have raised"
+    except m.ZohoUnresolvedWrite:
+        pass
+
+    entry = m._ledger_load()["entries"][-1]
+    assert entry["outcome"] == "unresolved", entry
+    assert entry["command"] == "apply_handover", entry
+    # the module written when it failed, not "handover" - the ledger is joined
+    # to records on module and id
+    assert entry["module"] == "Leads", entry
+    detail = entry["detail"]
+    assert detail["intent"] == {"Owner": {"id": "200"}}, detail
+    assert detail["batch_index"] == 0, detail
+    assert detail["moved_before_failure"] == 0, detail
+    assert detail["targets"] == [
+        {"id": "1", "before": {"Owner": "100"},
+         "before_modified_time": "t1"}], detail["targets"]
+
+
+def t_handover_scan_still_reports_counts_with_timestamps():
+    """Adding Modified_Time to the ownership query must not change the split."""
+    m, calls = _handover_env(USERS, [[{"id": "1", "Modified_Time": "t1"}],
+                                     [{"id": "2", "Modified_Time": "t2"}],
+                                     [], [], [{"id": "2"}, {"id": "3"}]])
+    out, _ = m.zoho_plan_handover({"from_user": "100", "to_user": "200"}, {})
+    assert out["total"] == 2, out
+    leads_q = [c for c in calls if "from Leads" in c][0]
+    assert "Modified_Time" in leads_q, leads_q
+
+
+def t_unresolved_merge_stops_before_the_next_loser():
+    """After a merge with no verdict the master's state is unknown. Merging
+    the next loser into it would be a confident wrong answer."""
+    records = {"100": {"id": "100", "Modified_Time": "t1"},
+               "200": {"id": "200", "Modified_Time": "t1"},
+               "300": {"id": "300", "Modified_Time": "t1"}}
+    args = {"module": "Leads", "master_id": "100", "loser_ids": ["200", "300"]}
+    h, calls, store = _merge_helpers(records)
+    m = load(h)
+    m.zoho_plan_merge(args, {})
+
+    inner = h["http_post_json"]
+
+    def _post(url, obj, **k):
+        if url.endswith("/actions/merge"):
+            calls.append(("POST", url))
+            return 500, _UNRESOLVED_BODY
+        return inner(url, obj, **k)
+
+    h["http_post_json"] = _post
+    try:
+        m.zoho_apply_merge(args, {})
+        assert False, "should have raised"
+    except m.ZohoUnresolvedWrite:
+        pass
+
+    merge_calls = [u for meth, u in calls if u.endswith("/actions/merge")]
+    assert len(merge_calls) == 1, merge_calls
+
+    entries = _entries(store)
+    assert [e["outcome"] for e in entries] == ["applied", "unresolved"], entries
+    detail = entries[-1]["detail"]
+    assert detail["verdict_basis"] == "existence", detail
+    assert detail["attempted"] == "200", detail
+    assert detail["not_attempted"] == ["300"], detail
+    assert detail["merged_before_failure"] == [], detail
+    # points back at the archive, which is the only readable copy of the loser
+    assert detail["archive_seq"] == entries[0]["seq"], detail
+    assert entries[0]["detail"]["archive"][0]["id"] == "200", entries[0]
+
+
 for name, fn in sorted((k, v) for k, v in list(globals().items())
                        if k.startswith("t_")):
     check(name[2:], fn)
