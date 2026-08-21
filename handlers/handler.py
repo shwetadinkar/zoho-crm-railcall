@@ -1,4 +1,4 @@
-"""shweta/zoho-crm 0.9.0
+"""shweta/zoho-crm 0.9.1
 
 Vault entry `zoho`:
 
@@ -362,6 +362,33 @@ def _summarise(response, action, stamp):
                     "field": r.get("details", {}).get("api_name")} for r in bad],
         "origin": _origin(stamp),
     }
+
+
+def _governed_written(rows):
+    """Keep only the written rows a later read can actually be matched against.
+
+    A `written` list whose rows carry no modified_time is the worst of both
+    worlds: _ledger_index sees a non-empty list, so it does not count the entry
+    as unmatchable, and it adds nothing to the governed set either. The
+    approval goes silently missing instead of being reported as one that cannot
+    be matched. Filtering here means an entry either carries usable timestamps
+    or says plainly that it has none.
+
+    Returns None rather than [] when nothing survives, because _ledger_index
+    tests the value for truth and None is the honest shape for "no timestamps".
+
+    The four older apply paths do not need this: _summarise's Modified_Time
+    guarantee was verified live for create, update and upsert responses. DELETE
+    is the one whose response shape has never been captured, which is exactly
+    why apply_delete goes through here.
+
+    Record ids are NOT lost by filtering. Every entry also carries `targets`,
+    and _entry_record_ids reads the union, so custody_report still finds the
+    record even when the timestamp is missing.
+    """
+    kept = [r for r in (rows or [])
+            if isinstance(r, dict) and r.get("id") and r.get("modified_time")]
+    return kept or None
 
 
 def _resolve_fields(module, requested):
@@ -1149,7 +1176,13 @@ def zoho_plan_delete(inputs, stamp):
 
 
 def zoho_apply_delete(inputs, stamp):
-    """Commit a delete plan, refusing if any record moved since it was made."""
+    """Commit a delete plan, refusing if any record moved since it was made.
+
+    Both outcomes reach the ledger. The prior values are recorded because
+    Zoho's recycle bin entry has no display name and no deleted-by, so for 60
+    days the ledger entry is the more readable of the two records that a delete
+    happened, and after that it is the only one.
+    """
     module = _module_name(inputs)
     query = str(inputs.get("query", "")).strip()
     if not query.lower().lstrip("( ").startswith("select"):
@@ -1211,6 +1244,25 @@ def zoho_apply_delete(inputs, stamp):
                          for r in snapshot]})
     result = _summarise(response, "apply delete plan to " + module, stamp)
     result["records_deleted"] = len(snapshot)
+
+    # A governed delete used to leave no record at all. It does not produce a
+    # scan_changes false positive the way a handover does - a deleted record
+    # stops coming back from COQL, so nothing scans it - but audit_pack and
+    # custody_report both showed the approval as never having happened.
+    #
+    # Zoho's DELETE response has never been captured, so whether its SUCCESS
+    # rows carry Modified_Time is unknown. _governed_written decides: with
+    # timestamps the entry is matchable, without them it is reported as
+    # unmatchable rather than disappearing. Either way `targets` and `before`
+    # carry the ids and the prior state.
+    entry = _ledger_append(_ledger_note(
+        "applied", "apply_delete", module,
+        _plan_key("delete:" + module, query, {}),
+        {"records": len(snapshot), "fields": list(_DELETE_GUARD_FIELDS),
+         "written": _governed_written(result.get("written")),
+         "before": [{"id": r["id"], "before": r["before"]} for r in snapshot],
+         "targets": [r["id"] for r in snapshot]}))
+    result["ledger_seq"] = entry["seq"]
     return result, None
 
 
@@ -2508,7 +2560,13 @@ def zoho_plan_handover(inputs, stamp):
 
 
 def zoho_apply_handover(inputs, stamp):
-    """Reassign everything in the plan, refusing if the set changed."""
+    """Reassign everything in the plan, refusing if the set changed.
+
+    Writes one applied ledger entry per module, carrying the post-write
+    Modified_Time Zoho returned for each record. Without it scan_changes
+    reported every governed reassignment as an ungoverned edit - a false
+    positive in the one command whose entire job is to have none.
+    """
     users = (_call("GET", "users",
                    params={"type": "ActiveConfirmedUsers", "per_page": 200})
              .get("users") or [])
@@ -2559,6 +2617,7 @@ def zoho_apply_handover(inputs, stamp):
     owner = {"Owner": {"id": str(taker["id"])}}
     moved, failed, errors = 0, 0, []
     done = {}
+    written_by_module = {}
     for module, ids in found.items():
         for start in range(0, len(ids), 100):
             batch = ids[start:start + 100]
@@ -2596,6 +2655,10 @@ def zoho_apply_handover(inputs, stamp):
             for row in result.get("data", []) or []:
                 if row.get("code") == "SUCCESS":
                     moved += 1
+                    _d = row.get("details") or {}
+                    written_by_module.setdefault(module, []).append(
+                        {"id": _d.get("id"),
+                         "modified_time": _d.get("Modified_Time")})
                 else:
                     failed += 1
                     errors.append({"module": module, "code": row.get("code"),
@@ -2606,6 +2669,33 @@ def zoho_apply_handover(inputs, stamp):
         raise RuntimeError("Zoho rejected every reassignment. First error: %s"
                            % errors[0])
 
+    # One entry per module, not one per handover. _ledger_index joins the
+    # ledger to a record on module and id, so a single entry spanning four
+    # modules could not be matched to a record in any of them - which is the
+    # same reason the refusal above is written per module.
+    #
+    # This is what closes the false positive: before it, every record a
+    # governed handover moved came back from scan_changes as an ungoverned
+    # edit, because Owner and Modified_Time had both moved and nothing in the
+    # ledger said why.
+    ledger_seqs = {}
+    for module, ids in found.items():
+        if not ids:
+            continue
+        entry = _ledger_append(_ledger_note(
+            "applied", "apply_handover", module, handover_key,
+            {"records": len(ids), "fields": ["Owner"],
+             "changes": dict(owner),
+             "from_user": str(leaver["id"]), "to_user": str(taker["id"]),
+             "written": _governed_written(written_by_module.get(module)),
+             # Every id attempted, not only the ones Zoho confirmed. A record
+             # that failed still had a governed attempt made against it, and
+             # `written` is where the difference is recorded.
+             "before": [{"id": rid, "before": {"Owner": str(leaver["id"])}}
+                        for rid in ids],
+             "targets": [str(i) for i in ids]}))
+        ledger_seqs[module] = entry["seq"]
+
     return {
         "ok": True,
         "action": "handover %s to %s" % (leaver.get("full_name"),
@@ -2614,6 +2704,7 @@ def zoho_apply_handover(inputs, stamp):
         "failed": failed,
         "per_module": {m: len(v) for m, v in found.items()},
         "errors": errors[:10],
+        "ledger_seqs": ledger_seqs,
         "origin": _origin(stamp),
     }, None
 
@@ -2806,10 +2897,9 @@ def _ledger_load():
 def _ledger_append(record):
     """Append one entry and return it, chained to whatever came before.
 
-    Called on every apply that refuses, and on every apply that succeeds except
-    apply_delete and apply_handover - see their own notes. A refusal is the
-    more valuable of the two: it is the only direct evidence the control works,
-    and custody_report reads them.
+    Called on every apply, successful or refused. A refusal is the more
+    valuable of the two: it is the only direct evidence the control works, and
+    custody_report reads them.
 
     Every refusal carries `targets`, the ids it declined to touch. A count
     cannot be joined to a record, so an entry without them is evidence that a

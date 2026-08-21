@@ -3381,6 +3381,231 @@ def t_refusals_carry_targets_on_every_path():
     assert not missing, "refusal notes without targets at lines %r" % missing
 
 
+
+
+# ------------------------------- governed delete and handover reach the ledger
+#
+# Both paths used to succeed silently. The handover case was a false positive
+# in scan_changes: Owner and Modified_Time had both moved and nothing in the
+# ledger said why, so every governed reassignment came back as an ungoverned
+# edit.
+
+def _delete_env(delete_response, store=None):
+    """A delete plan that applies cleanly, with a controllable DELETE body."""
+    seq = [([{"id": "1"}], False), ([{"id": "1", "Modified_Time": "t1"}], False),
+           ([{"id": "1"}], False), ([{"id": "1", "Modified_Time": "t1"}], False)]
+    store = store if store is not None else {}
+
+    def _post(url, obj, **k):
+        rows, more = seq.pop(0) if seq else ([], False)
+        return 200, json.dumps({"data": rows, "info": {"more_records": more}}).encode()
+
+    h = {"oauth_refresh": lambda p, **k: {"access_token": "t", "instance_url": "https://x"},
+         "http_get_json": lambda u, **k: (200, b"{}"), "http_post_json": _post,
+         "http_delete_json": lambda u, **k: (200, json.dumps(delete_response).encode()),
+         "WS": "/tmp/rc-test",
+         "jload": lambda path, default=None: store.get(path, default if default is not None else {}),
+         "jsave": lambda path, obj: store.__setitem__(path, obj)}
+    return h, store
+
+
+def t_successful_delete_is_written_to_the_ledger():
+    h, store = _delete_env({"data": [{"code": "SUCCESS", "details": {
+        "id": "1", "Modified_Time": "2026-03-02T10:00:00+05:30"}}]})
+    m = load(h)
+    args = {"module": "Leads", "query": "select id from Leads where x = 1"}
+    m.zoho_plan_delete(args, {})
+    out, err = m.zoho_apply_delete(args, {})
+    assert err is None and out["records_deleted"] == 1, out
+
+    entries = store["/tmp/rc-test/zoho_ledger.json"]["entries"]
+    assert [e["outcome"] for e in entries] == ["applied"], entries
+    entry = entries[0]
+    assert entry["command"] == "apply_delete", entry
+    assert out["ledger_seq"] == entry["seq"], out
+    assert entry["detail"]["targets"] == ["1"], entry["detail"]
+    # the prior values survive the record: Zoho's bin entry has neither a
+    # display name nor a deleted-by
+    assert entry["detail"]["before"] == [
+        {"id": "1", "before": {"Modified_Time": "t1"}}], entry["detail"]
+
+
+def t_delete_without_a_timestamp_is_unmatchable_not_invisible():
+    """Zoho's DELETE response shape has never been captured. If it carries no
+    Modified_Time the entry must report itself as unmatchable, not vanish from
+    both the governed set and the unmatchable count."""
+    h, store = _delete_env({"data": [{"code": "SUCCESS",
+                                      "details": {"id": "1"}}]})
+    m = load(h)
+    args = {"module": "Leads", "query": "select id from Leads where x = 1"}
+    m.zoho_plan_delete(args, {})
+    m.zoho_apply_delete(args, {})
+
+    entry = store["/tmp/rc-test/zoho_ledger.json"]["entries"][0]
+    assert entry["detail"]["written"] is None, entry["detail"]
+    index = m._ledger_index(with_records=True)
+    assert index["unmatchable"] == 1, index["unmatchable"]
+    assert index["governed"] == set(), index["governed"]
+    # and the record is still reachable, because targets carries the id
+    assert "Leads:1" in index["by_record"], list(index["by_record"])
+
+
+def t_delete_with_a_timestamp_is_governed():
+    h, store = _delete_env({"data": [{"code": "SUCCESS", "details": {
+        "id": "1", "Modified_Time": "2026-03-02T10:00:00+05:30"}}]})
+    m = load(h)
+    args = {"module": "Leads", "query": "select id from Leads where x = 1"}
+    m.zoho_plan_delete(args, {})
+    m.zoho_apply_delete(args, {})
+    governed, _covers, unmatchable = m._governed_index()
+    assert governed == {"Leads:1:2026-03-02T04:30:00Z"}, governed
+    assert unmatchable == 0, unmatchable
+
+
+def _clean_handover_env(store_out=None):
+    """A handover that applies cleanly across Leads and Deals."""
+    # _HANDOVER_MODULES order is Leads, Deals, Contacts, Accounts, then
+    # plan_handover's extra all-Deals pass for the excluded-closed count.
+    leads = [{"id": "1", "Modified_Time": "t1"}]
+    deals = [{"id": "5", "Modified_Time": "t1"}]
+    plan_scans = [leads, deals, [], [], deals]
+    apply_scans = [leads, deals, [], []]
+
+    def _put(url, obj, hdrs):
+        rows = [{"code": "SUCCESS",
+                 "details": {"id": r.get("id"),
+                             "Modified_Time": "2026-03-02T10:00:00+05:30"}}
+                for r in (obj or {}).get("data", [])]
+        return 200, json.dumps({"data": rows}).encode()
+
+    return _handover_env(USERS, plan_scans + apply_scans, put=_put)
+
+
+def t_successful_handover_is_written_per_module():
+    m, _calls = _clean_handover_env()
+    args = {"from_user": "100", "to_user": "200"}
+    m.zoho_plan_handover(args, {})
+    out, err = m.zoho_apply_handover(args, {})
+    assert err is None and out["moved"] == 2, out
+
+    entries = m._ledger_load()["entries"]
+    assert [e["outcome"] for e in entries] == ["applied", "applied"], entries
+    by_module = {e["module"]: e for e in entries}
+    assert set(by_module) == {"Leads", "Deals"}, list(by_module)
+    assert out["ledger_seqs"] == {"Leads": by_module["Leads"]["seq"],
+                                  "Deals": by_module["Deals"]["seq"]}, out
+
+    leads = by_module["Leads"]["detail"]
+    assert leads["targets"] == ["1"], leads
+    assert leads["fields"] == ["Owner"], leads
+    assert leads["changes"] == {"Owner": {"id": "200"}}, leads
+    assert leads["before"] == [{"id": "1", "before": {"Owner": "100"}}], leads
+    assert leads["written"] == [
+        {"id": "1", "modified_time": "2026-03-02T10:00:00+05:30"}], leads
+
+
+def t_governed_handover_is_no_longer_an_ungoverned_edit():
+    """The false positive this closes, end to end.
+
+    Hand over a record, then scan. Before this change the reassignment came
+    back in `ungoverned` - Owner and Modified_Time had both moved and nothing
+    in the ledger said why.
+    """
+    m, _calls = _clean_handover_env()
+    args = {"from_user": "100", "to_user": "200"}
+    m.zoho_plan_handover(args, {})
+    m.zoho_apply_handover(args, {})
+    book = m._ledger_load()
+
+    # now scan the same record, as the scheduler would
+    scan = _change_helpers(rows_by_module={"Leads": [
+        {"id": "1", "Modified_Time": "2026-03-02T10:00:00+05:30",
+         "Modified_By": {"name": "The OAuth User"},
+         "Created_Time": "2026-01-01T00:00:00+05:30"}]}, ledger=book)
+    m2 = load(scan)
+    out, _err = m2.zoho_scan_changes({"modules": ["Leads"]}, {})
+    assert out["count"] == 1, out
+    assert out["ungoverned_count"] == 0, out
+    assert out["changes"][0]["governed"] is True, out["changes"]
+
+
+def t_handover_records_ids_even_when_zoho_omits_the_timestamp():
+    """Same guarantee as delete: no timestamp means unmatchable, not absent."""
+    plan_scans = [[{"id": "1", "Modified_Time": "t1"}], [], [], [], []]
+    apply_scans = [[{"id": "1", "Modified_Time": "t1"}], [], [], []]
+    m, _calls = _handover_env(
+        USERS, plan_scans + apply_scans,
+        put=lambda u, o, h: (200, json.dumps({"data": [
+            {"code": "SUCCESS", "details": {"id": "1"}}]}).encode()))
+    args = {"from_user": "100", "to_user": "200"}
+    m.zoho_plan_handover(args, {})
+    m.zoho_apply_handover(args, {})
+    entry = m._ledger_load()["entries"][0]
+    assert entry["detail"]["written"] is None, entry["detail"]
+    assert entry["detail"]["targets"] == ["1"], entry["detail"]
+
+
+def t_handover_that_zoho_rejects_entirely_records_nothing():
+    """The ledger writes after the API call so a change that never happened is
+    never recorded. A total rejection raises before any entry is written."""
+    plan_scans = [[{"id": "1", "Modified_Time": "t1"}], [], [], [], []]
+    apply_scans = [[{"id": "1", "Modified_Time": "t1"}], [], [], []]
+    m, _calls = _handover_env(
+        USERS, plan_scans + apply_scans,
+        put=lambda u, o, h: (200, json.dumps({"data": [
+            {"code": "INVALID_DATA", "message": "no"}]}).encode()))
+    args = {"from_user": "100", "to_user": "200"}
+    m.zoho_plan_handover(args, {})
+    try:
+        m.zoho_apply_handover(args, {})
+        assert False, "should have raised"
+    except RuntimeError as e:
+        assert "rejected every reassignment" in str(e), e
+    assert m._ledger_load()["entries"] == [], m._ledger_load()
+
+
+def t_custody_report_sees_a_governed_handover():
+    """The other half of the false positive: custody_report called the record
+    diverged, because the ledger had nothing to trace its state to."""
+    m, _calls = _clean_handover_env()
+    args = {"from_user": "100", "to_user": "200"}
+    m.zoho_plan_handover(args, {})
+    m.zoho_apply_handover(args, {})
+    book = m._ledger_load()
+
+    h, _c, store = _custody_helpers(
+        [{"id": "1", "Modified_Time": "2026-03-02T10:00:00+05:30",
+          "Modified_By": {"name": "The OAuth User"}}],
+        store={"/tmp/rc-test/zoho_ledger.json": book})
+    m2 = load(h)
+    out, _err = m2.zoho_custody_report({"module": "Leads",
+                                        "record_ids": ["1"]}, {})
+    assert out["governed"] == 1 and out["diverged"] == 0, out
+    rec = _custody_records(out, store)["1"]
+    assert [e["kind"] for e in rec["timeline"]] == ["governed_change"], rec
+    assert rec["timeline"][0]["command"] == "apply_handover", rec
+
+
+def t_every_apply_records_both_outcomes():
+    """_ledger_append's docstring says it is called on every apply, successful
+    or refused. Pin that against the source so it stays true."""
+    import ast as _ast
+    tree = _ast.parse(open(HANDLER).read())
+    funcs = {n.name: n for n in tree.body if isinstance(n, _ast.FunctionDef)}
+    for name in ("zoho_apply_update", "zoho_apply_delete", "zoho_apply_handover",
+                 "zoho_apply_rollback", "zoho_apply_merge", "zoho_apply_upsert"):
+        outcomes = set()
+        for node in _ast.walk(funcs[name]):
+            if (isinstance(node, _ast.Call)
+                    and isinstance(node.func, _ast.Name)
+                    and node.func.id == "_ledger_note"
+                    and node.args
+                    and isinstance(node.args[0], _ast.Constant)):
+                outcomes.add(node.args[0].value)
+        assert "applied" in outcomes, "%s records no applied entry" % name
+        assert "refused" in outcomes, "%s records no refusal" % name
+
+
 for name, fn in sorted((k, v) for k, v in list(globals().items())
                        if k.startswith("t_")):
     check(name[2:], fn)

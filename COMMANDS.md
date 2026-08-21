@@ -1200,11 +1200,22 @@ Commits a plan from `plan_delete`. Inputs: `module`, `query`.
 ```
 
 ```json
-{ "ok": true, "action": "apply delete plan to Leads", "succeeded": 4, "failed": 0, "records_deleted": 4 }
+{ "ok": true, "action": "apply delete plan to Leads", "succeeded": 4, "failed": 0, "records_deleted": 4, "ledger_seq": 15 }
 ```
 
 Records go to the recycle bin and are recoverable for 60 days. This does not
 purge.
+
+The delete is written to the ledger with the prior values, because Zoho's bin
+entry has no display name and no deleted-by: for 60 days the ledger entry is the
+more readable of the two records that a delete happened, and after that it is
+the only one.
+
+Zoho's DELETE response has never been captured, so whether it returns a
+post-write `Modified_Time` is unknown. If it does, the entry is matchable like
+any other. If it does not, the entry reports itself as unmatchable rather than
+going quiet - it never silently disappears from both the governed set and the
+unmatchable count.
 
 ## zoho.apply_handover
 
@@ -1224,12 +1235,19 @@ and optionally `modules` and `closed_deals`, which must match what was planned.
   "failed": 0,
   "per_module": {"Leads": 5, "Deals": 8, "Contacts": 14, "Accounts": 14},
   "errors": [],
+  "ledger_seqs": {"Leads": 44, "Deals": 45, "Contacts": 46, "Accounts": 47},
   "origin": {"initiated_via": "railcall-airlock", "stamp": "2026-07-29T15:22:15Z"}
 }
 ```
 
 Reassignment runs in batches of 100 per module. The receipt is your handover
 record: who moved what, to whom, approved by whom, when.
+
+One ledger entry per module, not one per handover: the ledger is joined to a
+record on module and id, so a single entry spanning four modules could not be
+matched to a record in any of them. Each carries the post-write `Modified_Time`
+Zoho returned, which is what lets `scan_changes` recognise the reassignment as
+governed.
 
 ## zoho.apply_rollback
 
@@ -1642,8 +1660,14 @@ the moment it became most useful.
 allows, and `zoho.custody_report` puts the result in a record's history beside
 the approvals and refusals.
 
-`apply_delete` and `apply_handover` record their refusals, and record an
-unresolved write when one happens. A **successful** delete or handover is still
-not recorded, so `scan_changes` reports both as ungoverned and `custody_report`
-will call an affected record `diverged`. That is a real gap in coverage, named
-here rather than left to be discovered.
+All six apply paths now record both outcomes. `apply_delete` and
+`apply_handover` were the exceptions until 0.9.1: a successful delete or
+handover went unrecorded, so `scan_changes` reported every governed
+reassignment as an ungoverned edit and `custody_report` called the record
+`diverged`. A false positive in the two commands whose whole purpose is to have
+none.
+
+Ledger entries written before 0.9.1 are unchanged, so a handover performed
+earlier stays reported as ungoverned. There is no way to backfill it: the
+post-write `Modified_Time` it would need was never returned to anything that
+kept it.
