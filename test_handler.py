@@ -2532,6 +2532,461 @@ def t_unresolved_merge_stops_before_the_next_loser():
     assert entries[0]["detail"]["archive"][0]["id"] == "200", entries[0]
 
 
+
+
+# ------------------------------------------------- reconcile_writes (0.9.0)
+#
+# Three verdict bases, three different questions. Most of what follows is
+# proving the branch is real rather than one table with special cases.
+
+_T0 = "2026-01-01T00:00:00+05:30"      # before_modified_time on every entry
+_T1 = "2026-01-02T00:00:00+05:30"      # the record moved
+_T0_UTC = "2025-12-31T18:30:00Z"       # the same instant, spelled differently
+
+
+def _recon_helpers(current_rows, store=None):
+    """COQL id-lookups return whichever of `current_rows` were asked for.
+
+    A row absent from `current_rows` is a record that no longer reads back,
+    which is the input for every "deleted since" branch.
+    """
+    import re
+    calls = []
+    store = store if store is not None else {}
+
+    def _post(url, obj, **k):
+        q = (obj or {}).get("select_query", "")
+        calls.append(q)
+        found = re.search(r"in \(([^)]*)\)", q)
+        wanted = {x.strip() for x in found.group(1).split(",")} if found else set()
+        rows = [r for r in current_rows if str(r.get("id")) in wanted]
+        return 200, json.dumps({"data": rows}).encode()
+
+    return {"oauth_refresh": lambda p, **k: {"access_token": "t",
+                                             "instance_url": "https://x"},
+            "http_get_json": lambda u, **k: (200, b"{}"),
+            "http_post_json": _post,
+            "http_delete_json": lambda u, **k: (200, b"{}"),
+            "WS": "/tmp/rc-test",
+            "jload": lambda path, default=None: store.get(path, default if default is not None else {}),
+            "jsave": lambda path, obj: store.__setitem__(path, obj)}, calls, store
+
+
+def _seed(m, detail, command="apply_update", module="Leads"):
+    """Put one unresolved entry in the ledger and return it."""
+    base = {"reason": "Zoho returned HTTP 500 on PUT Leads.",
+            "attempted_at": "2026-01-01T12:00:00Z"}
+    base.update(detail)
+    return m._ledger_append(m._ledger_note("unresolved", command, module,
+                                           "key-1", base))
+
+
+def _value_detail(**over):
+    detail = {"verdict_basis": "value", "intent": {"S": "new"}, "fields": ["S"],
+              "targets": [{"id": "1", "before": {"S": "old"},
+                           "before_modified_time": _T0}]}
+    detail.update(over)
+    return detail
+
+
+def _reconcile(current_rows, detail, command="apply_update", inputs=None):
+    h, _calls, store = _recon_helpers(current_rows)
+    m = load(h)
+    _seed(m, detail, command=command)
+    out, err = m.zoho_reconcile_writes(inputs or {}, {})
+    assert err is None, err
+    return m, out, store
+
+
+def _file_records(out, store):
+    return store[out["report_path"]]["entries"][0]["records"]
+
+
+# --------------------------------------------------- verdict_basis: "value"
+def t_recon_value_landed():
+    _m, out, store = _reconcile(
+        [{"id": "1", "S": "new", "Modified_Time": _T1}], _value_detail())
+    assert (out["landed"], out["not_landed"], out["unknown"]) == (1, 0, 0), out
+    assert _file_records(out, store)[0]["verdict"] == "landed", out
+    # a judgement, never a confirmation
+    assert "consistent with having landed" in out["summary"], out["summary"]
+    assert "not confirmations" in out["summary"], out["summary"]
+
+
+def t_recon_value_not_landed():
+    _m, out, _s = _reconcile(
+        [{"id": "1", "S": "old", "Modified_Time": _T0}], _value_detail())
+    assert (out["landed"], out["not_landed"], out["unknown"]) == (0, 1, 0), out
+
+
+def t_recon_value_reverted_is_unknown():
+    """Value back where it started but the record moved: the write may have
+    landed and been reverted, or missed while someone else edited."""
+    _m, out, store = _reconcile(
+        [{"id": "1", "S": "old", "Modified_Time": _T1}], _value_detail())
+    assert (out["landed"], out["not_landed"], out["unknown"]) == (0, 0, 1), out
+    assert "reverted" in _file_records(out, store)[0]["note"], out
+
+
+def t_recon_value_third_party_edit_is_unknown():
+    _m, out, _s = _reconcile(
+        [{"id": "1", "S": "somebody else", "Modified_Time": _T1}],
+        _value_detail())
+    assert out["unknown"] == 1 and out["landed"] == 0, out
+
+
+def t_recon_value_missing_record_is_unknown():
+    """The half of the branch proof: on a value entry a vanished record tells
+    you nothing. Compare with the existence test below."""
+    _m, out, store = _reconcile([], _value_detail())
+    assert (out["landed"], out["not_landed"], out["unknown"]) == (0, 0, 1), out
+    assert "no longer readable" in _file_records(out, store)[0]["note"], out
+
+
+def t_recon_value_ignores_timezone_spelling():
+    """+05:30 and the same instant in Z must not read as a change."""
+    _m, out, _s = _reconcile(
+        [{"id": "1", "S": "old", "Modified_Time": _T0_UTC}], _value_detail())
+    assert out["not_landed"] == 1, out
+
+
+def t_recon_value_no_op_write_is_unknown():
+    """Setting a field to the value it already held: landing and not landing
+    produce identical records, so neither table row may win by accident."""
+    _m, out, store = _reconcile(
+        [{"id": "1", "S": "same", "Modified_Time": _T1}],
+        _value_detail(intent={"S": "same"},
+                      targets=[{"id": "1", "before": {"S": "same"},
+                                "before_modified_time": _T0}]))
+    assert out["unknown"] == 1 and out["landed"] == 0, out
+    assert "already held" in _file_records(out, store)[0]["note"], out
+
+
+def t_recon_resolves_intent_per_target():
+    """apply_rollback restores each record to its own prior values, so the
+    entry-level intent is null and each target carries its own."""
+    detail = {"verdict_basis": "value", "intent": None, "fields": ["S"],
+              "targets": [{"id": "1", "intent": {"S": "a"},
+                           "before": {"S": "x"}, "before_modified_time": _T0},
+                          {"id": "2", "intent": {"S": "b"},
+                           "before": {"S": "y"}, "before_modified_time": _T0}]}
+    _m, out, store = _reconcile(
+        [{"id": "1", "S": "a", "Modified_Time": _T1},
+         {"id": "2", "S": "y", "Modified_Time": _T0}],
+        detail, command="apply_rollback")
+    verdicts = {r["id"]: r["verdict"] for r in _file_records(out, store)}
+    assert verdicts == {"1": "landed", "2": "not_landed"}, verdicts
+
+
+def t_recon_owner_lookup_compares_on_id():
+    """Owner is written as {"id": x} and read back as {"name":..., "id": x}.
+    Comparing the raw dicts would make every handover permanently unknown."""
+    detail = {"verdict_basis": "value", "intent": {"Owner": {"id": "200"}},
+              "fields": ["Owner"],
+              "targets": [{"id": "1", "before": {"Owner": "100"},
+                           "before_modified_time": _T0}]}
+    _m, out, _s = _reconcile(
+        [{"id": "1", "Owner": {"name": "Bob Taker", "id": "200"},
+          "Modified_Time": _T1}], detail, command="apply_handover")
+    assert out["landed"] == 1, out
+
+
+# ----------------------------------------------- verdict_basis: "existence"
+def _existence_detail(**over):
+    detail = {"verdict_basis": "existence", "intent": None,
+              "fields": ["Modified_Time"],
+              "targets": [{"id": "1", "before": {"Modified_Time": _T0},
+                           "before_modified_time": _T0}]}
+    detail.update(over)
+    return detail
+
+
+def t_recon_existence_missing_record_is_landed():
+    """The other half of the branch proof: on a delete, gone IS the signal.
+    The same input reads `unknown` on a value entry."""
+    _m, out, store = _reconcile([], _existence_detail(),
+                                command="apply_delete")
+    assert (out["landed"], out["not_landed"], out["unknown"]) == (1, 0, 0), out
+    assert "what was asked" in _file_records(out, store)[0]["note"], out
+
+
+def t_recon_existence_present_and_untouched_is_not_landed():
+    _m, out, _s = _reconcile([{"id": "1", "Modified_Time": _T0}],
+                             _existence_detail(), command="apply_delete")
+    assert out["not_landed"] == 1, out
+
+
+def t_recon_existence_present_and_moved_is_unknown():
+    _m, out, _s = _reconcile([{"id": "1", "Modified_Time": _T1}],
+                             _existence_detail(), command="apply_delete")
+    assert out["unknown"] == 1, out
+
+
+# ------------------------------------------- verdict_basis: "modified_time"
+def _mtime_detail(**over):
+    detail = {"verdict_basis": "modified_time", "intent": None,
+              "fields": ["Email"], "creates_unreconcilable": 4,
+              "targets": [{"id": "1", "before": {"Modified_Time": _T0},
+                           "before_modified_time": _T0}]}
+    detail.update(over)
+    return detail
+
+
+def t_recon_modified_time_never_lands():
+    """apply_upsert never read the values it was overwriting, so movement is
+    visible and direction is not. No input may produce `landed`."""
+    for rows in ([{"id": "1", "Email": "a@x.com", "Modified_Time": _T1}],
+                 [{"id": "1", "Email": "a@x.com", "Modified_Time": _T0}],
+                 []):
+        _m, out, _s = _reconcile(rows, _mtime_detail(), command="apply_upsert")
+        assert out["landed"] == 0, (rows, out)
+    assert "can never read as landed" in out["covers"], out["covers"]
+
+
+def t_recon_modified_time_untouched_is_not_landed():
+    _m, out, _s = _reconcile([{"id": "1", "Modified_Time": _T0}],
+                             _mtime_detail(), command="apply_upsert")
+    assert out["not_landed"] == 1, out
+
+
+def t_recon_modified_time_moved_is_unknown():
+    _m, out, store = _reconcile([{"id": "1", "Modified_Time": _T1}],
+                                _mtime_detail(), command="apply_upsert")
+    assert out["unknown"] == 1, out
+    assert "never recorded" in _file_records(out, store)[0]["note"], out
+    # the created half is surfaced, not silently dropped
+    assert store[out["report_path"]]["entries"][0]["creates_unreconcilable"] == 4
+
+
+# ------------------------------------------------------------ other branches
+def t_recon_unrecognised_basis_is_unknown():
+    """Guessing a default from the command name is how a reconciler ends up
+    confident about a record it has no evidence for."""
+    _m, out, store = _reconcile([{"id": "1", "S": "new", "Modified_Time": _T1}],
+                                _value_detail(verdict_basis="sideways"))
+    assert out["unknown"] == 1 and out["landed"] == 0, out
+    assert "unrecognised verdict_basis" in _file_records(out, store)[0]["note"]
+
+
+def t_recon_merge_is_existence_only_and_never_lands():
+    detail = {"verdict_basis": "existence", "intent": None,
+              "master_id": "100", "archive_seq": 1,
+              "targets": [{"id": "100", "role": "master",
+                           "before": {"Modified_Time": _T0},
+                           "before_modified_time": _T0},
+                          {"id": "200", "role": "loser",
+                           "before": {"Modified_Time": _T0},
+                           "before_modified_time": _T0}]}
+    # master still there, loser gone: exactly what a completed merge looks like
+    _m, out, store = _reconcile([{"id": "100", "Modified_Time": _T0}],
+                                detail, command="apply_merge")
+    assert out["landed"] == 0, out
+    assert out["unknown"] == 2, out
+    report = store[out["report_path"]]["entries"][0]
+    assert report["merge_state"] == "losers_absent", report
+    assert "does not prove one" in report["records"][0]["note"], report
+
+
+def t_recon_merge_master_gone_is_indeterminate():
+    detail = {"verdict_basis": "existence", "master_id": "100",
+              "targets": [{"id": "100", "role": "master",
+                           "before": {"Modified_Time": _T0},
+                           "before_modified_time": _T0},
+                          {"id": "200", "role": "loser",
+                           "before": {"Modified_Time": _T0},
+                           "before_modified_time": _T0}]}
+    _m, out, store = _reconcile([], detail, command="apply_merge")
+    assert store[out["report_path"]]["entries"][0]["merge_state"] == "indeterminate"
+    assert out["landed"] == 0, out
+
+
+def t_recon_pre_version_entry_is_reported_separately():
+    """No before_modified_time means no baseline. Judging it by value alone is
+    a materially weaker test and would make the headline counts mean two
+    different things."""
+    _m, out, store = _reconcile(
+        [{"id": "1", "S": "new", "Modified_Time": _T1}],
+        _value_detail(targets=[{"id": "1", "before": {"S": "old"}}]))
+    assert out["unreconcilable"] == 1, out
+    assert (out["landed"], out["not_landed"], out["unknown"]) == (0, 0, 0), out
+    assert out["records_checked"] == 0, out
+    assert "no baseline" in _file_records(out, store)[0]["note"], out
+    assert "excluded from the counts" in out["summary"], out["summary"]
+
+
+def t_recon_does_not_readjudicate_committed_records():
+    """A batched write records what it confirmed before contact was lost.
+    Folding that certainty back into the counts would launder it as
+    inference."""
+    detail = _mtime_detail(
+        written_before_failure=[{"id": "1", "modified_time": _T0}],
+        targets=[{"id": "1", "before": {"Modified_Time": _T0},
+                  "before_modified_time": _T0},
+                 {"id": "2", "before": {"Modified_Time": _T0},
+                  "before_modified_time": _T0}])
+    _m, out, store = _reconcile([{"id": "1", "Modified_Time": _T1},
+                                 {"id": "2", "Modified_Time": _T0}],
+                                detail, command="apply_upsert")
+    assert out["already_committed"] == 1, out
+    assert out["records_checked"] == 1, out
+    assert out["not_landed"] == 1, out
+    assert [r["id"] for r in _file_records(out, store)] == ["2"], out
+
+
+def t_recon_batch_is_judged_per_record():
+    """The case an operator cannot work out by hand: one entry, mixed fates."""
+    detail = _value_detail(targets=[
+        {"id": "1", "before": {"S": "old"}, "before_modified_time": _T0},
+        {"id": "2", "before": {"S": "old"}, "before_modified_time": _T0},
+        {"id": "3", "before": {"S": "old"}, "before_modified_time": _T0}])
+    _m, out, store = _reconcile(
+        [{"id": "1", "S": "new", "Modified_Time": _T1},
+         {"id": "2", "S": "old", "Modified_Time": _T0},
+         {"id": "3", "S": "wandered off", "Modified_Time": _T1}], detail)
+    assert (out["landed"], out["not_landed"], out["unknown"]) == (1, 1, 1), out
+    assert out["records_checked"] == 3, out
+
+
+def t_recon_read_failure_is_not_a_deleted_record():
+    """A COQL failure and a deleted record are different facts. Confusing them
+    would manufacture a `landed` verdict out of a network problem."""
+    h, _calls, store = _recon_helpers([])
+    m = load(h)
+    _seed(m, _existence_detail(), command="apply_delete")
+    h["http_post_json"] = lambda u, o, **k: (_ for _ in ()).throw(
+        RuntimeError("coql exploded"))
+    out, _err = m.zoho_reconcile_writes({}, {})
+    assert out["landed"] == 0 and out["unknown"] == 1, out
+    assert store[out["report_path"]]["entries"][0]["read_error"], out
+
+
+# ---------------------------------------------------------- recording, scope
+def t_recon_records_nothing_by_default():
+    h, _calls, store = _recon_helpers([{"id": "1", "S": "new",
+                                        "Modified_Time": _T1}])
+    m = load(h)
+    _seed(m, _value_detail())
+    before = len(store["/tmp/rc-test/zoho_ledger.json"]["entries"])
+    out, _err = m.zoho_reconcile_writes({}, {})
+    after = store["/tmp/rc-test/zoho_ledger.json"]["entries"]
+    assert len(after) == before == 1, after
+    assert out["recorded"] is False, out
+    assert "re-run with record_outcome" in out["summary"], out["summary"]
+
+
+def t_recon_record_outcome_appends_a_verifiable_entry():
+    h, _calls, store = _recon_helpers([{"id": "1", "S": "new",
+                                        "Modified_Time": _T1}])
+    m = load(h)
+    _seed(m, _value_detail())
+    out, _err = m.zoho_reconcile_writes({"record_outcome": True}, {})
+    assert out["recorded"] is True, out
+    entries = store["/tmp/rc-test/zoho_ledger.json"]["entries"]
+    assert [e["outcome"] for e in entries] == ["unresolved", "reconciled"], entries
+    detail = entries[1]["detail"]
+    assert detail["resolves_seq"] == 1 and detail["resolved"] is True, detail
+    assert detail["verdicts"] == [{"id": "1", "verdict": "landed"}], detail
+    intact, checked, bad = m._ledger_verify()
+    assert intact and checked == 2 and bad is None, (intact, checked, bad)
+
+
+def t_recon_all_unknown_entry_stays_open():
+    """Nothing was determined. Marking it resolved would be the fake-green
+    this module exists to avoid."""
+    h, _calls, store = _recon_helpers([{"id": "1", "S": "elsewhere",
+                                        "Modified_Time": _T1}])
+    m = load(h)
+    _seed(m, _value_detail())
+    out, _err = m.zoho_reconcile_writes({"record_outcome": True}, {})
+    assert out["still_open"] == [1], out
+    assert "remains open" in out["summary"], out["summary"]
+    entries = store["/tmp/rc-test/zoho_ledger.json"]["entries"]
+    assert entries[1]["detail"]["resolved"] is False, entries[1]
+
+    # and a second run still finds it, because the look settled nothing
+    h2, _c2, _s2 = _recon_helpers([{"id": "1", "S": "elsewhere",
+                                    "Modified_Time": _T1}], store=store)
+    m2 = load(h2)
+    again, _e = m2.zoho_reconcile_writes({}, {})
+    assert again["entries_checked"] == 1, again
+
+
+def t_recon_a_resolved_entry_is_not_checked_again():
+    h, _calls, store = _recon_helpers([{"id": "1", "S": "new",
+                                        "Modified_Time": _T1}])
+    m = load(h)
+    _seed(m, _value_detail())
+    m.zoho_reconcile_writes({"record_outcome": True}, {})
+    h2, _c2, _s2 = _recon_helpers([{"id": "1", "S": "new",
+                                    "Modified_Time": _T1}], store=store)
+    m2 = load(h2)
+    out, _err = m2.zoho_reconcile_writes({}, {})
+    assert out["entries_checked"] == 0, out
+    assert "Nothing this module attempted" in out["summary"], out["summary"]
+
+
+def t_recon_ledger_seq_selects_one_entry():
+    h, _calls, store = _recon_helpers([{"id": "1", "S": "new",
+                                        "Modified_Time": _T1}])
+    m = load(h)
+    _seed(m, _value_detail())
+    _seed(m, _value_detail())
+    out, _err = m.zoho_reconcile_writes({"ledger_seq": 2}, {})
+    assert out["entries_checked"] == 1, out
+    assert store[out["report_path"]]["entries"][0]["ledger_seq"] == 2, out
+
+
+def t_recon_ledger_seq_must_name_an_open_unresolved_entry():
+    h, _calls, _store = _recon_helpers([])
+    m = load(h)
+    m._ledger_append(m._ledger_note("applied", "apply_update", "Leads", "k", {}))
+    try:
+        m.zoho_reconcile_writes({"ledger_seq": 1}, {})
+        assert False, "should have raised"
+    except RuntimeError as e:
+        assert "not an unresolved write" in str(e), e
+
+
+def t_recon_ids_go_to_the_file_not_the_receipt():
+    """redact_output strips ids out of a receipt, so anything actionable has
+    to be a path - the same rule audit_pack and hygiene_scan follow."""
+    _m, out, store = _reconcile([{"id": "1", "S": "new", "Modified_Time": _T1}],
+                               _value_detail())
+    # The field NAME appears in the limits sentence, which is the point of
+    # that sentence. What must not appear is a record id or a per-record list.
+    blob = json.dumps(out)
+    assert '"1"' not in blob, out
+    assert "records" not in out and "verdicts" not in out, out
+    assert out["report_path"] in store, list(store)
+    assert _file_records(out, store)[0]["id"] == "1", out
+
+
+def t_recon_writes_nothing_to_zoho():
+    """mode: read. Every call it makes must be a COQL select."""
+    h, calls, _store = _recon_helpers([{"id": "1", "S": "new",
+                                        "Modified_Time": _T1}])
+    m = load(h)
+    m._put = lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("reconcile_writes issued a PUT"))
+    _seed(m, _value_detail())
+    m.zoho_reconcile_writes({"record_outcome": True}, {})
+    assert calls, "no read was made"
+    for q in calls:
+        assert q.lower().lstrip().startswith("select"), q
+
+
+def t_verify_ledger_counts_reconciled():
+    h, _, _ = _ledger_helpers([], [])
+    m = load(h)
+    m._ledger_append(m._ledger_note("unresolved", "apply_update", "Leads", "a", {}))
+    m._ledger_append(m._ledger_note("reconciled", "reconcile_writes", "Leads",
+                                    "a", {"resolves_seq": 1, "resolved": True}))
+    out, _err = m.zoho_verify_ledger({}, {})
+    assert out["unresolved"] == 1 and out["reconciled"] == 1, out
+    out2, _e = m.zoho_audit_pack({"outcome": "reconciled"}, {})
+    assert out2["entries"] == 1 and out2["reconciled"] == 1, out2
+
+
 for name, fn in sorted((k, v) for k, v in list(globals().items())
                        if k.startswith("t_")):
     check(name[2:], fn)

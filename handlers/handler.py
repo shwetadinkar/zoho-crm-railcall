@@ -1500,6 +1500,7 @@ def zoho_apply_merge(inputs, stamp):
          "irreversible": True,
          "archive": archive}))
 
+    _merge_before = {str(r.get("id")): r.get("Modified_Time") for r in current}
     merged, failed = [], []
     for index, rid in enumerate(loser_ids):
         # One loser at a time so a partial failure is legible: with a single
@@ -1534,9 +1535,17 @@ def zoho_apply_merge(inputs, stamp):
                  "merged_before_failure": list(merged),
                  "attempted": rid,
                  "not_attempted": loser_ids[index + 1:],
-                 "targets": ([{"id": master_id, "role": "master"}]
-                             + [{"id": lid, "role": "loser"}
-                                for lid in loser_ids])})
+                 # `current` was read before the archive and before the merge,
+                 # so these timestamps predate the attempt. Reconciliation
+                 # checks a merge for existence, but a master that is still
+                 # present and still untouched is a stronger statement than
+                 # "still present", and it is free to record here.
+                 "targets": ([{"id": rec_id, "role": role,
+                               "before": {"Modified_Time": _merge_before.get(rec_id)},
+                               "before_modified_time": _merge_before.get(rec_id)}
+                              for rec_id, role in ([(master_id, "master")]
+                                                   + [(lid, "loser")
+                                                      for lid in loser_ids])])})
         except Exception as e:                                  # noqa: BLE001
             failed.append({"id": rid, "error": str(e)[:200]})
 
@@ -2734,12 +2743,14 @@ def zoho_verify_ledger(inputs, stamp):
     refused = sum(1 for e in book["entries"] if e.get("outcome") == "refused")
     unresolved = sum(1 for e in book["entries"]
                      if e.get("outcome") == "unresolved")
+    reconciled = sum(1 for e in book["entries"]
+                     if e.get("outcome") == "reconciled")
 
     if intact:
-        summary = ("Ledger intact. %d entries verified, %d applied, %d refused "
-                   "and %d unresolved. Tamper-evident, not tamper-proof: this "
-                   "proves no entry was altered in place."
-                   % (checked, applied, refused, unresolved))
+        summary = ("Ledger intact. %d entries verified, %d applied, %d refused, "
+                   "%d unresolved and %d reconciled. Tamper-evident, not "
+                   "tamper-proof: this proves no entry was altered in place."
+                   % (checked, applied, refused, unresolved, reconciled))
         if unresolved:
             # Counted separately rather than folded into applied, because that
             # is the whole point: Zoho never said whether these landed, and a
@@ -2763,10 +2774,13 @@ def zoho_verify_ledger(inputs, stamp):
         "applied": applied,
         "refused": refused,
         "unresolved": unresolved,
+        "reconciled": reconciled,
         "covers": "changes made through this module only; edits made in the "
                   "Zoho UI are not visible here. An unresolved entry records a "
                   "write whose outcome Zoho never confirmed - it is neither an "
-                  "applied change nor a refused one",
+                  "applied change nor a refused one. A reconciled entry records "
+                  "what a later re-read inferred about one of those, which is "
+                  "an inference and not a confirmation",
         "summary": summary,
         "origin": _origin(stamp),
     }, None
@@ -2788,9 +2802,11 @@ def zoho_audit_pack(inputs, stamp):
     until = str(inputs.get("until", "")).strip()
     module = str(inputs.get("module", "")).strip()
     outcome = str(inputs.get("outcome", "")).strip().lower()
-    if outcome and outcome not in ("applied", "refused", "unresolved"):
-        raise RuntimeError("'outcome' must be 'applied', 'refused' or "
-                           "'unresolved' if given, got %r." % outcome)
+    if outcome and outcome not in ("applied", "refused", "unresolved",
+                                   "reconciled"):
+        raise RuntimeError("'outcome' must be 'applied', 'refused', "
+                           "'unresolved' or 'reconciled' if given, got %r."
+                           % outcome)
 
     intact, checked, bad = _ledger_verify()
     book = _ledger_load()
@@ -2820,13 +2836,18 @@ def zoho_audit_pack(inputs, stamp):
                        "made directly in the Zoho UI are not represented. An "
                        "entry with outcome 'unresolved' is a write Zoho never "
                        "returned a verdict on: it may have landed, may not, "
-                       "and may have landed for some of its targets only."),
+                       "and may have landed for some of its targets only. A "
+                       "'reconciled' entry holds what a later re-read inferred "
+                       "about one of those, from the record's current state - "
+                       "an inference, never a confirmation."),
         "counts": {
             "entries": len(rows),
             "applied": sum(1 for r in rows if r.get("outcome") == "applied"),
             "refused": sum(1 for r in rows if r.get("outcome") == "refused"),
             "unresolved": sum(1 for r in rows
                               if r.get("outcome") == "unresolved"),
+            "reconciled": sum(1 for r in rows
+                              if r.get("outcome") == "reconciled"),
             # Deliberately counts applied entries only. An unresolved entry has
             # targets but no known outcome, so adding its records here would
             # claim changes that may never have happened.
@@ -2847,6 +2868,7 @@ def zoho_audit_pack(inputs, stamp):
         "applied": pack["counts"]["applied"],
         "refused": pack["counts"]["refused"],
         "unresolved": pack["counts"]["unresolved"],
+        "reconciled": pack["counts"]["reconciled"],
         "records_changed": pack["counts"]["records_changed"],
         "chain_intact": intact,
         "summary": ("Wrote %d ledger entries to %s - %d applied, %d refused, "
@@ -2859,6 +2881,469 @@ def zoho_audit_pack(inputs, stamp):
                        pack["counts"]["unresolved"],
                        pack["counts"]["records_changed"],
                        "intact" if intact else "BROKEN at entry %d" % bad)),
+        "origin": _origin(stamp),
+    }, None
+
+
+
+
+# --- reconciliation ---------------------------------------------------------
+#
+# Feature 1 keeps an unresolved write instead of discarding it. This is the
+# other half: re-read what was attempted and report what can and cannot be
+# established. Read-only; nothing here writes to Zoho.
+#
+# One fact shapes every line below. Zoho cannot be asked whether a request
+# landed. Every verdict is inferred from the record's current state, so the
+# strongest honest statement available is "consistent with having landed". A
+# command that printed "confirmed applied" would be worth less than no command
+# at all, because someone would believe it.
+
+_RECON_READ = 100          # ids per COQL read; the same ceiling _read_by_ids
+                           # is used with everywhere else in this module
+_RECON_BASES = ("value", "existence", "modified_time")
+
+
+def _recon_flat(value):
+    """Flatten a Zoho value so comparing two of them means what it looks like.
+
+    A lookup field is WRITTEN as {"id": "..."} and READ BACK as
+    {"name": "...", "id": "..."}. Comparing the raw dicts would report every
+    single Owner reassignment as a mismatch, which would make apply_handover
+    entries permanently unknown. The id is the part that was being set.
+    """
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        if "id" in value:
+            return str(value["id"])
+        return _json.dumps(value, sort_keys=True, separators=(",", ":"),
+                           default=str)
+    return str(value)
+
+
+def _recon_intent(entry_intent, target):
+    """Intent for one target: its own if it has one, else the entry's.
+
+    apply_rollback restores every record to its own prior values, so a single
+    entry-level intent would be wrong for all but one of them. Every other
+    apply path sets the same thing on every target and states it once.
+    """
+    own = target.get("intent")
+    if isinstance(own, dict):
+        return own
+    return entry_intent if isinstance(entry_intent, dict) else {}
+
+
+def _recon_columns(entry):
+    """COQL columns needed to adjudicate one entry.
+
+    Field names here come off a file on disk and are interpolated into COQL by
+    _read_by_ids. The ledger is tamper-EVIDENT, not tamper-proof - verify_ledger
+    says so in its own output - so a name that does not look like an api_name is
+    dropped rather than trusted. apply_update validates the same way before it
+    writes, and for the same reason.
+    """
+    detail = entry.get("detail") or {}
+    wanted = set()
+    if detail.get("verdict_basis") == "value":
+        for field in (detail.get("fields") or []):
+            wanted.add(str(field))
+        entry_intent = detail.get("intent")
+        for target in (detail.get("targets") or []):
+            wanted.update(_recon_intent(entry_intent, target).keys())
+    wanted.update(("Modified_Time", "Modified_By"))
+    safe = sorted(f for f in wanted if str(f).replace("_", "").isalnum())
+    return safe or ["Modified_Time"]
+
+
+def _recon_read(module, ids, columns):
+    """Current state of each id, or None for one that no longer reads back.
+
+    Returns (by_id, failed). A read that errors is NOT treated as "deleted":
+    a COQL failure and a deleted record are completely different facts, and
+    calling the first one the second would manufacture a `landed` verdict for
+    an existence check out of a network problem.
+    """
+    by_id, failed = {}, None
+    for start in range(0, len(ids), _RECON_READ):
+        batch = ids[start:start + _RECON_READ]
+        try:
+            for row in _read_by_ids(module, batch, columns):
+                if row.get("id"):
+                    by_id[str(row["id"])] = row
+        except Exception as error:                              # noqa: BLE001
+            failed = str(error)[:200]
+            break
+    return by_id, failed
+
+
+def _recon_moved(target, current):
+    """Has Modified_Time moved since just before the attempt?
+
+    Returns True, False, or None when it cannot be told. Both sides go through
+    _iso_utc, because Zoho renders +05:30 and a raw string comparison would
+    call two spellings of the same instant a change.
+    """
+    before = _iso_utc(target.get("before_modified_time"))
+    now = _iso_utc((current or {}).get("Modified_Time"))
+    if before is None or now is None:
+        return None
+    return now != before
+
+
+def _recon_same(current, values, columns):
+    """Do the record's current values match `values` on every named column?"""
+    if not columns:
+        return False
+    for field in columns:
+        if _recon_flat((current or {}).get(field)) != _recon_flat(values.get(field)):
+            return False
+    return True
+
+
+def _recon_one(basis, target, current, entry_intent):
+    """One record's verdict. Returns (verdict, note).
+
+    The three bases are genuinely different questions, not one question with
+    exceptions - see each branch. Anything unrecognised is `unknown`; guessing
+    a default from the command name is how a reconciler ends up confident about
+    a record it has no evidence for.
+    """
+    intent = _recon_intent(entry_intent, target)
+    before = target.get("before") or {}
+    moved = _recon_moved(target, current)
+    present = current is not None
+
+    if basis == "existence":
+        # A delete sets no value, so the only question the API can answer is
+        # whether the record is still there. The value table's last row
+        # inverts here: gone IS the signal, not the absence of one.
+        if not present:
+            return "landed", "record no longer readable, which is what was asked"
+        if moved is False:
+            return "not_landed", "record still present and untouched since the attempt"
+        return "unknown", ("record still present but modified since the attempt; "
+                           "a failed delete followed by an edit is "
+                           "indistinguishable from a delete that never fired")
+
+    if basis == "modified_time":
+        # apply_upsert fingerprinted Modified_Time alone - it never read the
+        # field values it was about to overwrite. Movement is visible;
+        # direction is not. This branch can never return `landed`, and the
+        # command output says so rather than letting a zero read as "none of
+        # them landed".
+        if not present:
+            return "unknown", "record no longer readable; nothing left to inspect"
+        if moved is False:
+            return "not_landed", "untouched since the attempt"
+        if moved is None:
+            return "unknown", "no usable Modified_Time to compare"
+        return "unknown", ("record was modified, but its prior values were "
+                           "never recorded, so this cannot say by whom or to what")
+
+    if basis != "value":
+        return "unknown", "unrecognised verdict_basis %r" % (basis,)
+
+    if not present:
+        return "unknown", "record no longer readable; deleted or merged since"
+    if moved is None:
+        return "unknown", "no usable Modified_Time to compare"
+
+    columns = sorted(intent)
+    hit_intent = _recon_same(current, intent, columns)
+    hit_before = _recon_same(current, before, columns)
+
+    # A write that set a field to the value it already held cannot be
+    # adjudicated at all: landing and not landing produce identical records.
+    # Caught before the table, because both of its first two rows match and
+    # whichever were checked first would win by accident.
+    if columns and hit_intent and hit_before:
+        return "unknown", ("the intended value is the value it already held, "
+                           "so landing and not landing look the same")
+    if hit_intent and moved:
+        return "landed", "current value matches the intent and the record moved"
+    if hit_before and not moved:
+        return "not_landed", "nothing has touched this record since the plan"
+    if hit_before and moved:
+        return "unknown", ("value is unchanged but the record moved: either the "
+                           "write missed and something else edited it, or it "
+                           "landed and was reverted")
+    return "unknown", "value matches neither the intent nor the prior state"
+
+
+def _recon_open(book, only_seq=None):
+    """Unresolved entries still awaiting a verdict, oldest first.
+
+    An entry is closed only by a `reconciled` entry that actually resolved it.
+    A reconciliation that determined nothing leaves it open on purpose: the
+    look happened and is recorded, but the question is still unanswered, and
+    hiding it would be the fake-green this module exists to avoid.
+    """
+    closed = set()
+    for entry in (book.get("entries") or []):
+        if entry.get("outcome") != "reconciled":
+            continue
+        detail = entry.get("detail") or {}
+        if detail.get("resolved") and detail.get("resolves_seq") is not None:
+            closed.add(detail["resolves_seq"])
+    out = []
+    for entry in (book.get("entries") or []):
+        if entry.get("outcome") != "unresolved":
+            continue
+        if only_seq is not None and entry.get("seq") != only_seq:
+            continue
+        if entry.get("seq") in closed:
+            continue
+        out.append(entry)
+    return out
+
+
+def zoho_reconcile_writes(inputs, stamp):
+    """Work out what happened to writes Zoho never confirmed. Read-only.
+
+    Feature 1 records an attempt when a write returns no verdict. This re-reads
+    those records and reports, per record, whether the current state is
+    consistent with the write having landed.
+
+    HONEST LIMITS, all of them, and all repeated in the output because that is
+    where an operator will read them:
+
+      - A verdict is INFERRED from current state. Zoho has no way to be asked
+        whether a request landed, so nothing here is a confirmation.
+      - `landed` means the record's current value matches the intent and the
+        record moved. Another actor making the same change independently is
+        indistinguishable from the write having landed.
+      - A record edited again after the attempt cannot be adjudicated at all.
+      - What can be established differs by which command made the attempt. An
+        apply_upsert entry can never be called landed, because the values it
+        was writing over were never read.
+      - Entries written before this feature carry no before_modified_time.
+        They are reported separately rather than mixed into the counts.
+      - A merge is checked for existence only. Master present and losers gone
+        is consistent with a completed merge and is not proof of one.
+
+    Verdicts are per record, not per entry. A batch of 100 can legitimately be
+    part landed and part not, and that is the case an operator cannot work out
+    by hand - it is the reason this command earns its place.
+
+    inputs: ledger_seq (number, optional), record_outcome (boolean, default
+            false)
+    """
+    helpers = __rc_helpers__  # noqa: F821
+    raw_seq = inputs.get("ledger_seq")
+    only_seq = None
+    if raw_seq not in (None, ""):
+        try:
+            only_seq = int(raw_seq)
+        except (TypeError, ValueError):
+            raise RuntimeError("'ledger_seq' must be a ledger sequence number, "
+                               "got %r. Run zoho.verify_ledger or "
+                               "zoho.audit_pack to find it." % raw_seq)
+    record_outcome = bool(inputs.get("record_outcome"))
+
+    book = _ledger_load()
+    open_entries = _recon_open(book, only_seq)
+
+    if only_seq is not None and not open_entries:
+        raise RuntimeError(
+            "Ledger entry %d is not an unresolved write awaiting reconciliation. "
+            "It may not exist, may be an applied or refused entry, or may "
+            "already have been resolved." % only_seq)
+
+    counts = {"landed": 0, "not_landed": 0, "unknown": 0}
+    reports, still_open, recorded_seqs = [], [], []
+    records_checked, already_committed, legacy = 0, 0, 0
+
+    for entry in open_entries:
+        detail = entry.get("detail") or {}
+        basis = detail.get("verdict_basis")
+        command = entry.get("command")
+        module = entry.get("module")
+        entry_intent = detail.get("intent")
+        targets = [t for t in (detail.get("targets") or []) if (t or {}).get("id")]
+
+        # Records the entry already recorded as confirmed written are settled.
+        # Re-adjudicating them would fold certainty back into the counts as if
+        # it were inference.
+        settled = set()
+        for row in (detail.get("written_before_failure") or []):
+            if isinstance(row, dict) and row.get("id"):
+                settled.add(str(row["id"]))
+
+        pending = [t for t in targets if str(t["id"]) not in settled]
+        already_committed += len(targets) - len(pending)
+
+        columns = _recon_columns(entry)
+        by_id, read_error = _recon_read(
+            module, [str(t["id"]) for t in pending], columns)
+
+        verdicts = []
+        for target in pending:
+            rid = str(target["id"])
+            if read_error is not None:
+                verdict, note = "unknown", ("could not re-read this record: %s"
+                                            % read_error)
+            elif target.get("before_modified_time") in (None, ""):
+                # Pre-feature entries. Counted and reported on their own rather
+                # than judged by value alone, which is a materially weaker test
+                # and would make the headline counts mean two different things.
+                verdict, note = "unreconcilable", (
+                    "entry predates before_modified_time; there is no baseline "
+                    "to compare against")
+            else:
+                verdict, note = _recon_one(basis, target, by_id.get(rid),
+                                           entry_intent)
+            verdicts.append({"id": rid, "verdict": verdict, "note": note,
+                             "modified_time": (by_id.get(rid) or {}).get("Modified_Time"),
+                             "modified_by": _recon_flat(
+                                 (by_id.get(rid) or {}).get("Modified_By")),
+                             "role": target.get("role")})
+            if verdict in counts:
+                counts[verdict] += 1
+                records_checked += 1
+            else:
+                legacy += 1
+
+        merge_state = None
+        if command == "apply_merge":
+            # A merge can only be checked for existence, and even a clean
+            # result is not proof: the losers being gone says a merge happened,
+            # not that it merged the fields correctly, and Zoho's own bin entry
+            # cannot be read back. Every verdict stays unknown.
+            master = str(detail.get("master_id") or "")
+            present_master = master in by_id
+            losers = [v for v in verdicts if v.get("role") == "loser"]
+            losers_gone = bool(losers) and all(v["id"] not in by_id for v in losers)
+            if read_error is not None or not present_master:
+                merge_state = "indeterminate"
+            elif losers_gone:
+                merge_state = "losers_absent"
+            else:
+                merge_state = "masters_present"
+            for verdict in verdicts:
+                if verdict["verdict"] in counts:
+                    counts[verdict["verdict"]] -= 1
+                    counts["unknown"] += 1
+                    verdict["verdict"] = "unknown"
+                    verdict["note"] = (
+                        "merge is checked for existence only; %s is consistent "
+                        "with a completed merge but does not prove one"
+                        % merge_state)
+
+        resolved = bool(verdicts) and any(
+            v["verdict"] in ("landed", "not_landed") for v in verdicts)
+        if not resolved:
+            still_open.append(entry.get("seq"))
+
+        report = {
+            "ledger_seq": entry.get("seq"),
+            "command": command,
+            "module": module,
+            "verdict_basis": basis,
+            "attempted_at": detail.get("attempted_at"),
+            "reason": detail.get("reason"),
+            "intent": entry_intent,
+            "already_committed": len(targets) - len(pending),
+            "creates_unreconcilable": detail.get("creates_unreconcilable"),
+            "merge_state": merge_state,
+            "read_error": read_error,
+            "resolved": resolved,
+            "records": verdicts,
+        }
+        reports.append(report)
+
+        if record_outcome:
+            # Opt-in on purpose. A read command that silently grows a
+            # hash-chained ledger on every run is a surprise, and the ledger
+            # rotates at 5000 entries. But a reconciliation nobody recorded is
+            # just a look, so when an operator wants it to be evidence one flag
+            # makes it evidence.
+            note = _ledger_append(_ledger_note(
+                "reconciled", "reconcile_writes", module, entry.get("plan_key"),
+                {"resolves_seq": entry.get("seq"),
+                 "resolved": resolved,
+                 "verdict_basis": basis,
+                 "merge_state": merge_state,
+                 "checked_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                 "verdicts": [{"id": v["id"], "verdict": v["verdict"]}
+                              for v in verdicts]}))
+            recorded_seqs.append(note["seq"])
+
+    name = "reconcile_writes" + time.strftime(".%Y%m%dT%H%M%SZ",
+                                              time.gmtime()) + ".json"
+    path = str(helpers.get("WS") or "").rstrip("/") + "/" + name
+    # Counts inline, records in the file. redact_output scrubs ids and dates out
+    # of a receipt, so anything an operator has to act on has to be a path -
+    # the same reason audit_pack and hygiene_scan write files.
+    helpers["jsave"](path, {
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "module_version": _module_version(),
+        "recorded_to_ledger": recorded_seqs or None,
+        "limits": [
+            "Verdicts are inferred from current state. Zoho cannot be asked "
+            "whether a request landed.",
+            "'landed' means the value matches the intent and the record moved. "
+            "Another actor making the same change is indistinguishable.",
+            "A record edited again after the attempt cannot be adjudicated.",
+            "An apply_upsert entry can never be 'landed': the values it was "
+            "writing over were never read.",
+            "A merge is checked for existence only.",
+        ],
+        "entries": reports,
+    })
+
+    checked = len(open_entries)
+    if not checked:
+        summary = ("No unresolved writes awaiting reconciliation. Nothing this "
+                   "module attempted is currently in doubt.")
+    else:
+        summary = (
+            "Checked %d unresolved %s covering %d record%s: %d consistent with "
+            "having landed, %d that nothing has touched since, %d that cannot "
+            "be told either way. Records are in %s. These are inferences from "
+            "current state, not confirmations - Zoho cannot be asked whether a "
+            "request landed."
+            % (checked, "entry" if checked == 1 else "entries", records_checked,
+               "" if records_checked == 1 else "s", counts["landed"],
+               counts["not_landed"], counts["unknown"], name))
+        if legacy:
+            summary += (" %d record%s came from entries written before this "
+                        "feature and have no baseline to compare against; they "
+                        "are excluded from the counts above."
+                        % (legacy, "" if legacy == 1 else "s"))
+        if already_committed:
+            summary += (" %d record%s already recorded as written before "
+                        "contact was lost and %s not re-examined."
+                        % (already_committed,
+                           "" if already_committed == 1 else "s",
+                           "was" if already_committed == 1 else "were"))
+        if still_open:
+            summary += (" %d entr%s nothing could be determined for and "
+                        "remain%s open."
+                        % (len(still_open), "y" if len(still_open) == 1 else "ies",
+                           "s" if len(still_open) == 1 else ""))
+        if not record_outcome:
+            summary += (" Nothing was recorded; re-run with record_outcome "
+                        "true to write these verdicts to the ledger.")
+
+    return {
+        "ok": True,
+        "entries_checked": checked,
+        "records_checked": records_checked,
+        "landed": counts["landed"],
+        "not_landed": counts["not_landed"],
+        "unknown": counts["unknown"],
+        "unreconcilable": legacy,
+        "already_committed": already_committed,
+        "report_path": path,
+        "still_open": still_open,
+        "recorded": bool(recorded_seqs),
+        "covers": "verdicts are inferred from current state and Modified_Time; "
+                  "Zoho has no way to confirm whether a request landed. An "
+                  "apply_upsert entry can never read as landed, and a merge is "
+                  "checked for existence only",
+        "summary": summary,
         "origin": _origin(stamp),
     }, None
 

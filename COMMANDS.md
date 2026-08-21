@@ -1,6 +1,6 @@
 # shweta/zoho-crm - command reference
 
-Twenty-nine commands. Seventeen reads, which run without approval. Twelve
+Thirty commands. Eighteen reads, which run without approval. Twelve
 writes, which stop at the airlock until a human approves the exact payload.
 
 Examples below use Zoho's own demo records, so you can follow along in a fresh
@@ -792,15 +792,18 @@ No inputs.
   "applied": 11,
   "refused": 3,
   "unresolved": 1,
-  "covers": "changes made through this module only; edits made in the Zoho UI are not visible here. An unresolved entry records a write whose outcome Zoho never confirmed - it is neither an applied change nor a refused one",
-  "summary": "Ledger intact. 15 entries verified, 11 applied, 3 refused and 1 unresolved. Tamper-evident, not tamper-proof: this proves no entry was altered in place. The 1 unresolved entry is a write Zoho never returned a verdict on; the entry holds what was attempted and the prior values, so it can be checked by hand."
+  "reconciled": 0,
+  "covers": "changes made through this module only; edits made in the Zoho UI are not visible here. An unresolved entry records a write whose outcome Zoho never confirmed - it is neither an applied change nor a refused one. A reconciled entry records what a later re-read inferred about one of those, which is an inference and not a confirmation",
+  "summary": "Ledger intact. 15 entries verified, 11 applied, 3 refused, 1 unresolved and 0 reconciled. Tamper-evident, not tamper-proof: this proves no entry was altered in place. The 1 unresolved entry is a write Zoho never returned a verdict on; the entry holds what was attempted and the prior values, so it can be checked by hand."
 }
 ```
 
-### The three outcome classes
+### The four outcome classes
 
 `applied` and `refused` are settled: the change happened, or the module stopped
-it. `unresolved` is the third case, and it is not a failure.
+it. `unresolved` is the third case, and it is not a failure. `reconciled` is the
+fourth, written by `zoho.reconcile_writes` when an operator asks for its findings
+to be kept.
 
 Zoho has no idempotency key. When a write returns no HTTP status at all, or a
 5xx, there is no way to retry it safely and no way to ask afterwards whether it
@@ -816,7 +819,7 @@ signal strong enough to tell "nothing happened" apart from "it happened and was
 changed back".
 
 An unresolved entry never counts towards `records_changed`. Nothing is known to
-have changed.
+have changed. `zoho.reconcile_writes` is what turns one back into an answer.
 
 **Three honest limits, all stated in the output rather than only here.**
 
@@ -829,7 +832,9 @@ org.
 
 An unresolved entry records an *attempt*, not an outcome. Reading one tells you
 what the module tried to do and what the records looked like beforehand. It does
-not tell you what happened, and nothing in this module will claim otherwise.
+not tell you what happened, and nothing in this module will claim otherwise -
+including a `reconciled` entry, which holds an inference from the record's state
+afterwards and says so.
 
 ## zoho.audit_pack
 
@@ -846,7 +851,7 @@ precisely what makes a pack worth reading. A human opens the file.
 | `since` | string | no | ISO date or datetime; omit for everything |
 | `until` | string | no | ISO date or datetime; omit for everything |
 | `module` | string | no | restrict to one module api_name |
-| `outcome` | string | no | `applied`, `refused` or `unresolved`; omit for all three |
+| `outcome` | string | no | `applied`, `refused`, `unresolved` or `reconciled`; omit for all four |
 
 ```json
 { "since": "2026-07-01", "outcome": "refused" }
@@ -860,6 +865,7 @@ precisely what makes a pack worth reading. A human opens the file.
   "applied": 0,
   "refused": 3,
   "unresolved": 0,
+  "reconciled": 0,
   "records_changed": 0,
   "chain_intact": true,
   "summary": "Wrote 3 ledger entries to audit_pack.20260801T071029Z.json - 0 applied, 3 refused, 0 unresolved, 0 records changed. Chain intact. Refusals are the useful half: they are the evidence the control fired. The unresolved count is writes Zoho never confirmed either way, and is not included in records changed."
@@ -887,6 +893,136 @@ doubt.
 `entries_verified` in the file's `chain` block counts the *whole* ledger, not the
 filtered subset, because integrity is a property of the chain rather than of your
 query.
+
+## zoho.reconcile_writes
+
+Answers the question an `unresolved` entry leaves open: did that write land?
+Read-only.
+
+It re-reads the records behind every unresolved entry and reports, per record,
+whether the current state is consistent with the write having landed.
+
+**Every verdict is an inference.** Zoho has no way to be asked whether a request
+landed, so this command is a careful reading of the evidence and never a
+confirmation. The output says so, in those words, because someone will otherwise
+paste a number into a report.
+
+| input | type | required | notes |
+|---|---|---|---|
+| `ledger_seq` | number | no | reconcile one unresolved entry; omit for every open one |
+| `record_outcome` | boolean | no | default false - report and change nothing |
+
+```json
+{ "record_outcome": true }
+```
+
+```json
+{
+  "ok": true,
+  "entries_checked": 2,
+  "records_checked": 47,
+  "landed": 31,
+  "not_landed": 14,
+  "unknown": 2,
+  "unreconcilable": 0,
+  "already_committed": 0,
+  "report_path": "/home/you/.railcall/station/.railcall_workspace/reconcile_writes.20260821T101500Z.json",
+  "still_open": [412],
+  "recorded": true,
+  "summary": "Checked 2 unresolved entries covering 47 records: 31 consistent with having landed, 14 that nothing has touched since, 2 that cannot be told either way. ..."
+}
+```
+
+Counts inline, records in the file - `redact_output` strips ids and dates out of
+a receipt, so anything actionable has to be a path. `still_open` lists the
+sequence numbers nothing could be determined for.
+
+### Verdicts are per record, not per entry
+
+A batch of 100 can legitimately be part landed and part not. That is exactly the
+case an operator cannot work out by hand, and it is why this command exists
+rather than a paragraph in the troubleshooting section.
+
+### Three bases, because the entries are not comparable
+
+The apply paths do not leave behind the same evidence, so each entry records the
+`verdict_basis` it can support and this branches on it. An entry with an
+unrecognised basis is `unknown`; nothing is guessed from the command name.
+
+**`value`** - `apply_update`, `apply_rollback`, `apply_handover`. The prior
+field values were read and recorded, so the full comparison is available.
+
+| current state | verdict |
+|---|---|
+| value matches the intent, `Modified_Time` moved | `landed` |
+| value matches the prior value, `Modified_Time` unchanged | `not_landed` |
+| value matches the prior value, `Modified_Time` moved | `unknown` - landed and reverted, or missed and edited |
+| value matches neither | `unknown` - somebody else was here |
+| record no longer readable | `unknown` |
+
+A write that set a field to the value it already held is `unknown` whatever the
+record looks like: landing and not landing produce identical records.
+
+**`existence`** - `apply_delete`, `apply_merge`. Nothing was set, so the only
+question the API can answer is whether the record is still there. The last row
+above inverts: gone is the *signal*.
+
+| current state | verdict |
+|---|---|
+| record no longer readable | `landed` |
+| record present, `Modified_Time` unchanged | `not_landed` |
+| record present, `Modified_Time` moved | `unknown` |
+
+**`modified_time`** - `apply_upsert`. The plan fingerprinted `Modified_Time`
+alone on the records that already existed; it never read their values. Movement
+is visible, direction is not.
+
+| current state | verdict |
+|---|---|
+| `Modified_Time` unchanged | `not_landed` |
+| `Modified_Time` moved | `unknown` |
+
+**This basis can never return `landed`**, and the output says so rather than
+letting a zero read as "none of them landed". The created half of a bulk upsert
+cannot be reconciled at all - a record that did not exist has no id to re-read -
+and the count is carried through as `creates_unreconcilable`.
+
+### Merge
+
+Reported as `merge_state`: `losers_absent`, `masters_present`, or
+`indeterminate`. Every verdict stays `unknown`. Master present and losers gone is
+what a completed merge looks like, but it is not proof the merge combined the
+fields correctly, and Zoho's bin entry cannot be read back to check.
+
+### `record_outcome`
+
+Default false: the command reports and changes nothing. Set it true and each
+entry gets one `reconciled` ledger entry carrying the per-record verdicts and a
+`resolves_seq` pointer back.
+
+Opt-in rather than automatic because a read command that silently grows a
+hash-chained ledger on every run is a surprise, and the ledger rotates at 5000
+entries. But a reconciliation nobody recorded is just a look, so one flag makes
+it evidence.
+
+**An entry whose verdicts are all `unknown` is not marked resolved** and stays
+open for the next run. Nothing was determined; saying otherwise would be the
+fake-green this module exists to avoid.
+
+### Honest limits, all of them stated in the output
+
+- Verdicts are inferred from current state. Zoho cannot be asked whether a
+  request landed.
+- `landed` means the value matches the intent and the record moved. Another
+  actor making the same change independently is indistinguishable.
+- A record edited again after the attempt cannot be adjudicated at all.
+- What can be established differs by which command made the attempt.
+- Entries written before this feature have no `before_modified_time` and no
+  baseline. They are counted as `unreconcilable` and kept out of the headline
+  numbers rather than judged by a weaker test.
+- Records a batched write already confirmed before contact was lost are settled,
+  not re-examined, and reported as `already_committed`.
+- A merge is checked for existence only.
 
 ## zoho.apply_update
 
@@ -1255,12 +1391,11 @@ reasons are in `errors`.
 
 **"was not retried"** - a write that hit a 5xx or a dropped connection is not
 retried, because Zoho has no idempotency header and a retried create leaves a
-duplicate. Check Zoho, then re-approve. The message also names a ledger entry:
-the attempt is recorded with the intended values, the records in the payload,
-and each one's `Modified_Time` from just before the call. Open it with
-`zoho.audit_pack --outcome unresolved` before you go looking - a record whose
-`Modified_Time` still matches the recorded one was almost certainly not
-written.
+duplicate. The message names a ledger entry: the attempt is recorded with the
+intended values, the records in the payload, and each one's `Modified_Time` from
+just before the call. Run `zoho.reconcile_writes` rather than checking by hand -
+it re-reads those records and says which are consistent with the write having
+landed and which nothing has touched since.
 
 **"No current plan"** - apply must repeat the planned inputs exactly. Plans
 expire after 60 minutes.
@@ -1384,6 +1519,9 @@ the entry holds an attempt rather than a change, and its records are excluded
 from every "changed" count. Recording nothing was the old behaviour and it was
 worse - the module knew exactly what it had tried to do and threw that away at
 the moment it became most useful.
+
+`zoho.reconcile_writes` turns these back into answers, as far as the API
+allows.
 
 `apply_delete` and `apply_handover` write a ledger entry only in this
 unresolved case. A successful delete or handover is not yet recorded, so
