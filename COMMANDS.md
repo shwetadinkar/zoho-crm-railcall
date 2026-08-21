@@ -1563,31 +1563,52 @@ partial set. Narrow the query.
 
 # What this module is allowed to call
 
-The manifest carries an empty `allowed_destinations` array:
+The manifest names the provider this module talks to and the hosts it reaches:
 
 ```json
-"allowed_destinations": []
+"allowed_destinations": [
+  {
+    "provider": "zoho",
+    "hosts": ["www.zohoapis.com", "accounts.zoho.com", "..."]
+  }
+]
 ```
 
-That is a declaration, not a restriction being accepted. This module talks to
-one place - the Zoho CRM REST API, over urllib - and calls no language model,
-no gateway, and no third party. The empty array says exactly that.
+Sixteen hosts in full: `www.zohoapis.<dc>` and `accounts.zoho.<dc>` for each of
+the eight Zoho datacenters (com, eu, in, com.au, jp, ca, com.cn, sa). Those are
+the only hosts the module opens a connection to - the API host comes from your
+vault entry's `instance_url`, the OAuth host from its `token_url`. If Zoho adds
+a datacenter, this list needs a new entry and a new signature.
 
-It matters because of how the station reads the field. A module with **no**
-`allowed_destinations` entry is treated as unrestricted, for backward
-compatibility with everything published before station v0.45. An **empty**
-array resolves to an empty set of permitted hosts. Silence and an empty
-declaration are not the same claim, and this module makes the second one.
+Earlier versions declared `"allowed_destinations": []` and this page described
+it as a signed statement that nothing here calls a language model. That reading
+was wrong, and the correction matters more than the original claim. In the
+station's primitive an empty array does not mean "no model" - it resolves to
+zero permitted destinations, which is a claim that the module reaches nothing
+at all. This module reaches Zoho on every command. The empty array said
+something false about it.
 
-The manifest is signed at publish time, so the declaration is covered by the
+Be precise about what the field does and does not do today. The station checks
+it in two places. `station.llm.complete()` matches the entry by provider and
+model, and this module never calls that function. The containment broker maps a
+provider name to hosts through a fixed table of language-model providers, so a
+provider it does not recognise - `zoho` among them - resolves to an empty host
+set. The `hosts` array above is therefore a declaration the station does not
+currently read back. It follows the shape already used by published modules
+that call an ordinary vendor API rather than a model, and it is the shape the
+field will need when that table stops being model-only.
+
+What the manifest is not is a sandbox. The capability that actually holds a
+module to a set of hosts is `requires.network`, enforced at load time by
+wrapping urllib, http.client and socket. This manifest declares
+`requires: {"subprocess": false}` and no `network` key, and an absent `network`
+key leaves the gate uninstalled. Adding one is a behaviour change, not a
+declaration, because a datacenter missing from the list would stop working
+rather than merely be undocumented.
+
+The manifest is signed at publish time, so everything above is covered by the
 module signature. A publisher cannot claim after the fact to have declared
 something they did not.
-
-Being precise about the limits: the check runs inside `station.llm.complete()`,
-which this module never calls, so nothing here will ever exercise it at
-runtime. The value is that a reviewer reading the manifest can see the claim
-and verify it against the signature. It is a contract about intent, not a
-sandbox.
 
 
 # Capping how often a write can run

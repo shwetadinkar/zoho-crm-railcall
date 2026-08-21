@@ -57,7 +57,7 @@ Every command, with examples and errors: [COMMANDS.md](COMMANDS.md)
 
 ## Limits
 
-100 records per write call, 2000 per scan. `plan_upsert` pages larger sets; its drift check covers existing records only. Deletes go to the recycle bin for 60 days; rollback covers updates only. Bulk and Notification APIs are not wrapped. The manifest declares `subprocess: false` and empty `allowed_destinations`: nothing here calls an LLM.
+100 records per write call, 2000 per scan. `plan_upsert` pages larger sets; drift there covers existing records only. Deletes go to the recycle bin for 60 days; rollback covers updates only. Bulk and Notification APIs are not wrapped. The manifest declares `subprocess: false` and pins `allowed_destinations` to Zoho's API and OAuth hosts.
 
 Any write can be capped per day in `rate_limits.json`; a block does not consume its approval.
 

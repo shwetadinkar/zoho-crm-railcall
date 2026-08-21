@@ -26,7 +26,29 @@
   "requires": {
     "subprocess": false
   },
-  "allowed_destinations": [],
+  "allowed_destinations": [
+    {
+      "provider": "zoho",
+      "hosts": [
+        "www.zohoapis.com",
+        "www.zohoapis.eu",
+        "www.zohoapis.in",
+        "www.zohoapis.com.au",
+        "www.zohoapis.jp",
+        "www.zohoapis.ca",
+        "www.zohoapis.com.cn",
+        "www.zohoapis.sa",
+        "accounts.zoho.com",
+        "accounts.zoho.eu",
+        "accounts.zoho.in",
+        "accounts.zoho.com.au",
+        "accounts.zoho.jp",
+        "accounts.zoho.ca",
+        "accounts.zoho.com.cn",
+        "accounts.zoho.sa"
+      ]
+    }
+  ],
   "commands": [
     {
       "id": "zoho.verify_connection",
