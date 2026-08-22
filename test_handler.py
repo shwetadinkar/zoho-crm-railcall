@@ -3586,6 +3586,105 @@ def t_custody_report_sees_a_governed_handover():
     assert rec["timeline"][0]["command"] == "apply_handover", rec
 
 
+def t_custody_survives_a_refused_merge():
+    """The v0.9.1 crash, from the live 17-node handover run.
+
+    apply_merge's refusal recorded `losers` as a COUNT while its applied entry
+    recorded the ids, and _entry_record_ids iterated it. One refused merge
+    anywhere in the chain took down custody_report for EVERY record it was
+    asked about - the report never reached the records it was called for.
+    """
+    records = {"100": {"id": "100", "Modified_Time": "t1"},
+               "200": {"id": "200", "Modified_Time": "t1"}}
+    h, _c, store = _merge_helpers(records)
+    m = load(h)
+    m.zoho_plan_merge(_M_ARGS, {})
+    moved = {"100": {"id": "100", "Modified_Time": "t1"},
+             "200": {"id": "200", "Modified_Time": "t9"}}
+    h2, _c2, _s2 = _merge_helpers(moved, store=store)
+    m2 = load(h2)
+    try:
+        m2.zoho_apply_merge(_M_ARGS, {})
+        assert False, "should have refused"
+    except RuntimeError:
+        pass
+
+    book = store["/tmp/rc-test/zoho_ledger.json"]
+    assert [e["outcome"] for e in book["entries"]] == ["refused"], book
+
+    # A record with nothing to do with the merge. Before the fix this raised
+    # TypeError("'int' object is not iterable") before reading a single record.
+    h3, _c3, store3 = _custody_helpers(
+        [{"id": "7", "Modified_Time": _C_NOW, "Modified_By": {"name": "x"}}],
+        store={"/tmp/rc-test/zoho_ledger.json": book})
+    m3 = load(h3)
+    out, err = m3.zoho_custody_report({"module": "Leads",
+                                       "record_ids": ["7"]}, {})
+    assert err is None, err
+    assert out["records"] == 1, out
+    assert _custody_records(out, store3)["7"]["id"] == "7", out
+
+
+def t_refused_merge_records_loser_ids_not_a_count():
+    """Every other refusal puts its count in `records` and its ids in a list.
+    The merge refusal was the one that disagreed, and disagreeing is what
+    crashed the reader."""
+    records = {"100": {"id": "100", "Modified_Time": "t1"},
+               "200": {"id": "200", "Modified_Time": "t1"},
+               "201": {"id": "201", "Modified_Time": "t1"}}
+    args = {"module": "Leads", "master_id": "100", "loser_ids": ["200", "201"]}
+    h, _c, store = _merge_helpers(records)
+    m = load(h)
+    m.zoho_plan_merge(args, {})
+    moved = dict(records, **{"200": {"id": "200", "Modified_Time": "t9"}})
+    h2, _c2, _s2 = _merge_helpers(moved, store=store)
+    m2 = load(h2)
+    try:
+        m2.zoho_apply_merge(args, {})
+        assert False, "should have refused"
+    except RuntimeError:
+        pass
+
+    detail = store["/tmp/rc-test/zoho_ledger.json"]["entries"][0]["detail"]
+    assert detail["losers"] == ["200", "201"], detail
+    assert detail["records"] == 2, detail
+    assert detail["targets"] == ["100", "200", "201"], detail
+    entry = store["/tmp/rc-test/zoho_ledger.json"]["entries"][0]
+    assert m2._entry_record_ids(entry) == ["100", "200", "201"], entry
+
+
+def t_entry_record_ids_reads_a_legacy_losers_count():
+    """Entries are hash-chained, so the old shape stays on disk forever and
+    the reader is the only end that can be fixed for it. The count itself
+    carries no ids - master_id is what survives - but it must not take the
+    report down with it."""
+    h, _c, _s = _custody_helpers([])
+    m = load(h)
+    legacy = {"outcome": "refused", "command": "apply_merge", "module": "Leads",
+              "detail": {"reason": "state moved between plan and apply",
+                         "master_id": "100", "losers": 3}}
+    assert m._entry_record_ids(legacy) == ["100"], legacy
+    for shape in (3, "200", {"id": "200"}, None):
+        assert m._detail_rows({"losers": shape}, "losers") == (
+            shape if isinstance(shape, list) else []), shape
+
+    # And through the command, which is where it was actually fatal. Fixing the
+    # writer cannot help here: this entry is already chained onto disk.
+    book = {"chain_start": "sha256:0" * 1, "entries": []}
+    h2, _c2, store2 = _custody_helpers(
+        [{"id": "7", "Modified_Time": _C_NOW, "Modified_By": {"name": "x"}}],
+        store={"/tmp/rc-test/zoho_ledger.json": book})
+    m2 = load(h2)
+    m2._ledger_append(m2._ledger_note(
+        "refused", "apply_merge", "Leads", "k",
+        {"reason": "state moved between plan and apply",
+         "master_id": "100", "losers": 3}))
+    out, err = m2.zoho_custody_report({"module": "Leads",
+                                       "record_ids": ["7"]}, {})
+    assert err is None, err
+    assert _custody_records(out, store2)["7"]["id"] == "7", out
+
+
 def t_every_apply_records_both_outcomes():
     """_ledger_append's docstring says it is called on every apply, successful
     or refused. Pin that against the source so it stays true."""

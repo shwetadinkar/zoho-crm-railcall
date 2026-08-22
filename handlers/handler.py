@@ -716,6 +716,22 @@ def _iso_utc(value):
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(secs))
 
 
+def _detail_rows(detail, key):
+    """One detail field as a list, whatever the writer actually put there.
+
+    Ledger entries are hash-chained, so a shape that was written once stays on
+    disk forever and every reader has to survive it. apply_merge proved that:
+    its refusal recorded `losers` as a COUNT while its applied entry recorded
+    the ids, and `for lid in detail["losers"]` on the refusal raised
+    "'int' object is not iterable" - killing custody_report for every record it
+    had been asked about, not just the merge's. Reading through here means a
+    disagreement between two writers costs the ids of one entry, never the
+    whole report.
+    """
+    value = detail.get(key)
+    return value if isinstance(value, list) else []
+
+
 def _entry_record_ids(entry):
     """Every record id one ledger entry names, however it names them.
 
@@ -728,23 +744,23 @@ def _entry_record_ids(entry):
     """
     detail = entry.get("detail") or {}
     ids = []
-    for row in (detail.get("written") or []):
+    for row in _detail_rows(detail, "written"):
         if isinstance(row, dict) and row.get("id"):
             ids.append(str(row["id"]))
-    for row in (detail.get("before") or []):
+    for row in _detail_rows(detail, "before"):
         if isinstance(row, dict) and row.get("id"):
             ids.append(str(row["id"]))
-    for row in (detail.get("targets") or []):
+    for row in _detail_rows(detail, "targets"):
         if isinstance(row, dict) and row.get("id"):
             ids.append(str(row["id"]))
         elif isinstance(row, (str, int)):
             ids.append(str(row))
-    for row in (detail.get("archive") or []):
+    for row in _detail_rows(detail, "archive"):
         if isinstance(row, dict) and row.get("id"):
             ids.append(str(row["id"]))
     if detail.get("master_id"):
         ids.append(str(detail["master_id"]))
-    for lid in (detail.get("losers") or []):
+    for lid in _detail_rows(detail, "losers"):
         if isinstance(lid, (str, int)):
             ids.append(str(lid))
     seen, out = set(), []
@@ -808,7 +824,7 @@ def _ledger_index(with_records=False):
         detail = entry.get("detail") or {}
 
         if outcome == "applied":
-            rows = detail.get("written")
+            rows = _detail_rows(detail, "written")
             if not rows:
                 unmatchable += 1
             else:
@@ -828,7 +844,7 @@ def _ledger_index(with_records=False):
             continue
 
         written_at = {}
-        for row in (detail.get("written") or []):
+        for row in _detail_rows(detail, "written"):
             if isinstance(row, dict) and row.get("id"):
                 written_at[str(row["id"])] = row.get("modified_time")
 
@@ -1675,7 +1691,14 @@ def zoho_apply_merge(inputs, stamp):
             "refused", "apply_merge", module, key,
             {"reason": "state moved between plan and apply",
              "expected": expected, "actual": actual,
-             "master_id": master_id, "losers": len(loser_ids),
+             # `losers` is the ids here, as the applied entry records
+             # them. It was the COUNT, alone among the six refusals in
+             # putting a number under a key that means ids everywhere
+             # else; `records` is where every other refusal puts its
+             # count. Entries already chained onto disk keep the old
+             # shape - _detail_rows is what makes those harmless.
+             "master_id": master_id, "losers": list(loser_ids),
+             "records": len(loser_ids),
              "targets": [master_id] + list(loser_ids)}))
         raise RuntimeError(
             "Refusing to merge. One of these records moved since the plan was "
