@@ -54,8 +54,13 @@ jobs:
                   if not c.get(k):
                       bad.append("%s missing %s" % (c["id"], k))
               for f, s in (c["input_schema"] or {}).items():
-                  if s.get("type") not in allowed:
-                      bad.append("%s.%s has unsupported type %s" % (c["id"], f, s.get("type")))
+                  # The station takes two spec shapes (routes/modules.py:555): a dict,
+                  # or a bare "field": "string" whose value IS the type. Resolve both -
+                  # .get() on a string raises AttributeError, killing the check instead
+                  # of reporting on it.
+                  t = s.get("type") if isinstance(s, dict) else s
+                  if t not in allowed:
+                      bad.append("%s.%s has unsupported type %s" % (c["id"], f, t))
           if bad:
               print("\n".join(bad)); sys.exit(1)
           print("manifest ok: %d commands" % len(m["commands"]))
