@@ -12,7 +12,7 @@ Zoho has no undo, so the module keeps its own: every applied change goes into a 
 
 The ledger records what the module did. `scan_changes` finds what happened outside it. `custody_report` answers the question those two exist for: for this record, what changed, who approved it, what was refused, and what the module cannot account for.
 
-Merging is the sharpest case: routine, irreversible, and Zoho's bin entry has no name and no deleted-by. `apply_merge` archives the loser's full record first - afterwards it is the only readable copy.
+Merging is the sharpest case: routine, irreversible, and Zoho's bin entry has no name and no deleted-by. `apply_merge` archives the loser's full record first; afterwards that is the only readable copy.
 
 For teams too small for a compliance function but regulated enough someone eventually asks who changed a record.
 
@@ -30,7 +30,7 @@ Self Client at api-console.zoho.com, scopes:
 ZohoCRM.modules.ALL,ZohoCRM.settings.fields.READ,ZohoCRM.users.READ,ZohoCRM.coql.READ
 ```
 
-Exchange the grant code for a refresh token, then save a vault entry named `zoho` with `refresh_token`, `client_id`, `client_secret`, `token_url`, `instance_url`. Swap `.in` for your region: a token minted in one datacenter fails in another.
+Exchange the grant code for a refresh token, then save a vault entry named `zoho` with `refresh_token`, `client_id`, `client_secret`, `token_url`, `instance_url`. Swap `.in` for your region: a token minted in one datacenter fails elsewhere.
 
 Run `zoho.verify_connection` first: it names any missing scope and what it blocks.
 
@@ -57,7 +57,7 @@ Every command, with examples and errors: [COMMANDS.md](COMMANDS.md)
 
 ## Limits
 
-100 records per write call, 2000 per scan. `plan_upsert` pages larger sets; drift there covers existing records only. Deletes go to the recycle bin for 60 days; rollback covers updates only. Bulk and Notification APIs are not wrapped. The manifest declares `subprocess: false` and pins `allowed_destinations` to Zoho's API and OAuth hosts.
+100 records per write call, 2000 per scan. `plan_upsert` pages larger sets; drift there covers existing records only. Deletes go to the recycle bin for 60 days; rollback covers updates only. Bulk and Notification APIs are not wrapped. The manifest pins `requires.network` to Zoho's hosts and declares `subprocess: false`. The sandbox refuses anything else.
 
 Any write can be capped per day in `rate_limits.json`; a block does not consume its approval.
 

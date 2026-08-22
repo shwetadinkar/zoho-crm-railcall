@@ -1611,11 +1611,13 @@ The manifest names the provider this module talks to and the hosts it reaches:
 ]
 ```
 
-Sixteen hosts in full: `www.zohoapis.<dc>` and `accounts.zoho.<dc>` for each of
-the eight Zoho datacenters (com, eu, in, com.au, jp, ca, com.cn, sa). Those are
-the only hosts the module opens a connection to - the API host comes from your
-vault entry's `instance_url`, the OAuth host from its `token_url`. If Zoho adds
-a datacenter, this list needs a new entry and a new signature.
+Twenty-four hosts in full, for each of the eight Zoho datacenters (com, eu, in,
+com.au, jp, ca, com.cn, sa): `www.zohoapis.<dc>`, the bare `zohoapis.<dc>`
+(which resolves to the same address, and is a shape an operator may have put in
+`instance_url`), and `accounts.zoho.<dc>`. Those are the only hosts the module
+opens a connection to - the API host comes from your vault entry's
+`instance_url`, the OAuth host from its `token_url`. If Zoho adds a datacenter,
+this list needs a new entry and a new signature.
 
 Earlier versions declared `"allowed_destinations": []` and this page described
 it as a signed statement that nothing here calls a language model. That reading
@@ -1636,12 +1638,34 @@ that call an ordinary vendor API rather than a model, and it is the shape the
 field will need when that table stops being model-only.
 
 What the manifest is not is a sandbox. The capability that actually holds a
-module to a set of hosts is `requires.network`, enforced at load time by
-wrapping urllib, http.client and socket. This manifest declares
-`requires: {"subprocess": false}` and no `network` key, and an absent `network`
-key leaves the gate uninstalled. Adding one is a behaviour change, not a
-declaration, because a datacenter missing from the list would stop working
-rather than merely be undocumented.
+module to a set of hosts is `requires.network`, and **this manifest now declares
+it**, with the same twenty-four hosts:
+
+```json
+"requires": {
+  "network": ["www.zohoapis.com", "zohoapis.com", "accounts.zoho.com", "..."],
+  "subprocess": false
+}
+```
+
+The station enforces it by wrapping `urllib.request.urlopen`,
+`http.client.HTTPConnection.__init__` and `socket.connect` process-wide, armed
+only while this module's own handler is on the stack. Anything else - a
+connection to a host not on the list, from the handler or from any station
+helper it calls - raises `SandboxViolation` before a packet leaves. The boot log
+says so: `network gate installed (contextvar-scoped) - allow: [...]`, beside the
+subprocess line.
+
+This is a behaviour change, not a declaration. The failure mode if Zoho adds a
+datacenter is that the module stops working there until the list and the
+signature are updated - loudly, with the rejected host named in the error, not
+silently.
+
+The list is enumerated rather than a glob on purpose. The matcher is
+`fnmatch`, whose `*` crosses dots, so `www.zohoapis.*` would also match
+`www.zohoapis.` followed by any domain an attacker can register. A wildcard
+broad enough to cover an unknown future datacenter is also broad enough to cover
+a squatted one, and a host allowlist that can be squatted past is not one.
 
 The manifest is signed at publish time, so everything above is covered by the
 module signature. A publisher cannot claim after the fact to have declared
