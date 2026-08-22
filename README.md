@@ -8,7 +8,7 @@ An approval binds to the inputs a person saw, not the records they point at. App
 
 `plan_update`, `plan_delete`, `plan_handover` and `plan_merge` snapshot state and hash it first. The matching `apply_` re-reads, re-hashes and refuses if anything moved. Scans page to completion, so a set is never half-reported.
 
-Zoho has no undo, so the module keeps its own: every applied change goes into a hash-chained ledger holding the prior values, so `plan_rollback` restores them. A write Zoho never answered is kept too; `reconcile_writes` reports what can be told.
+Zoho has no undo, so the module keeps its own: every applied change goes into a hash-chained ledger holding the prior values, so `plan_rollback` restores them. A write Zoho never answered is kept too; `reconcile_writes` reports what can be told about it.
 
 The ledger records what the module did. `scan_changes` finds what happened outside it. `custody_report` answers the question those two exist for: for this record, what changed, who approved it, what was refused, and what the module cannot account for.
 
@@ -61,4 +61,4 @@ Every command, with examples and errors: [COMMANDS.md](COMMANDS.md)
 
 Any write can be capped per day in `rate_limits.json`; a block does not consume its approval.
 
-Tested against Zoho CRM v8, thirty of the thirty-one against a live org.
+Tested against Zoho CRM v8, all thirty-one against a live org.

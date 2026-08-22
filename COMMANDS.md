@@ -1729,3 +1729,13 @@ Ledger entries written before 0.9.1 are unchanged, so a handover performed
 earlier stays reported as ungoverned. There is no way to backfill it: the
 post-write `Modified_Time` it would need was never returned to anything that
 kept it.
+
+`apply_merge` recorded its refusals with `losers` as a count while its applied
+entries recorded the ids, until 0.9.2. That crashed `custody_report` outright -
+one refused merge anywhere in the chain took the command down before it read a
+single record, for every record it was asked about. From 0.9.2 a refusal
+carries the ids under `losers` and the count under `records`, which is the
+shape the other five refusals already used. Both shapes stay on disk
+permanently, because entries are hash-chained and cannot be rewritten, so every
+reader accepts either; the ids for an older refusal come from `targets`, or
+from `master_id` on entries written before `targets` was recorded.
