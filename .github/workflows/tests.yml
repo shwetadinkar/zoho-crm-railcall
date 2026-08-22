@@ -10,6 +10,9 @@ jobs:
   test:
     runs-on: ubuntu-latest
     strategy:
+      # Both legs must report. With fail-fast on, one leg failing cancelled the
+      # other mid-step, so runs 34-39 never showed whether 3.9 was green.
+      fail-fast: false
       matrix:
         # 3.9 is the floor the RailCall station guarantees; 3.12 is what most
         # stations actually run.
@@ -28,7 +31,13 @@ jobs:
           m = json.load(open("module.json"))
           src = open("handlers/handler.py").read()
           fns = [n.name for n in ast.parse(src).body if isinstance(n, ast.FunctionDef)]
-          allowed = {"string", "number", "object", "array"}
+          # The JSON Schema primitives the station passes through untouched.
+          # `_module_arg_specs` (routes/modules.py:545) copies `type` verbatim into
+          # the palette, and `_normalize_module_input_schema` (mcp_server.py:831)
+          # rewrites only the non-JSON-Schema aliases `text` and `enum`. Anything
+          # outside this set reaches an MCP host as an invalid schema, so it stays
+          # a failure - but boolean and integer are valid and were wrongly excluded.
+          allowed = {"string", "number", "integer", "boolean", "object", "array"}
           bad = []
           ids = [c["id"] for c in m["commands"]]
           if len(ids) != len(set(ids)):
