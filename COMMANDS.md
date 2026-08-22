@@ -1,7 +1,9 @@
 # shweta/zoho-crm - command reference
 
-Thirty-one commands. Nineteen reads, which run without approval. Twelve
+Thirty-one commands. Nineteen reads, which never write to Zoho. Twelve
 writes, which stop at the airlock until a human approves the exact payload.
+All thirty-one need a human approval at runtime, reads included - see
+**Approvals** below before you plan around the split.
 
 Examples below use Zoho's own demo records, so you can follow along in a fresh
 trial org.
@@ -19,6 +21,25 @@ out of one command's output into another's input.
 
 **Every plan expires after 60 minutes** and is keyed on the exact inputs used.
 Apply with anything different and it will tell you no plan exists.
+
+**Approvals: every command needs one, reads included.** The station upgrades any
+command that declares egress or needs live credentials to
+`write_requires_approval` before it registers it - `_module_effective_mode` in
+the station's module route, `egress or needs_creds`. Every command here trips
+both: all thirty-one carry `requires: ["ZOHO_OAUTH"]`, and the manifest pins
+`allowed_destinations` to Zoho's hosts. So `zoho.plan_delete` and
+`zoho.scan_changes` return `blocked_by_policy` with mode
+`write_requires_approval` exactly like `zoho.apply_delete` does, and every one
+of them plans as `external_send` in a workflow.
+
+Confirmed at runtime, not inferred: both of those came back blocked in a live
+run. This document said the reads ran unattended, and that was wrong.
+
+The read/write split below is still the one that matters for your data - a read
+never writes to Zoho, never touches the ledger, and never needs a rollback - but
+it is a statement about what a command *does*, not about which ones run without
+a human. None of them do. Plan for thirty-one approvals, not twelve, and put the
+reads a workflow depends on behind the same gate as the writes.
 
 ---
 
@@ -344,9 +365,13 @@ than planning a no-op.
 
 # Writes
 
-Every command below is `write_requires_approval`. The cycle is
-preview, approve, execute. Executing without a matching approval returns
-`blocked_by_policy` with "no human approval bound to this exact payload".
+Every command below writes to Zoho. The cycle is preview, approve, execute.
+Executing without a matching approval returns `blocked_by_policy` with "no human
+approval bound to this exact payload".
+
+Every command *above* is `write_requires_approval` too, at runtime - see
+**Approvals** in Conventions. What separates these twelve is that they change
+your records, so a wrong one has to be rolled back rather than re-run.
 
 ## zoho.plan_rollback
 
@@ -710,10 +735,12 @@ chain. The chain rotates past 5000 entries into sealed archives, which this does
 not read.
 
 `unmatchable_ledger_entries` counts applied entries with no recorded
-`Modified_Time`: everything written before the ledger began recording it, plus
-every merge, since Zoho's merge response carries no timestamp for the master.
+`Modified_Time`: everything written before the ledger began recording it, every
+merge, since Zoho's merge response carries no timestamp for the master, and
+**every governed delete**, since Zoho's DELETE response carries none either.
 Those are real approvals this cannot match, so the count is reported rather than
-their records being quietly called ungoverned.
+their records being quietly called ungoverned. A steady non-zero count on an org
+that deletes through this module is expected, not a fault.
 
 `modified_by` is Zoho's record of who last touched the record. For writes this
 module made it is always the OAuth user, so it names a person only for changes
@@ -1091,9 +1118,10 @@ A record is `unproven` rather than `diverged` when any of these hold, and the
 file says which:
 
 - there is no ledger entry for it and its change predates `ledger_covers_from`
-- every entry it does have is unmatchable - merges, which Zoho does not
-  timestamp, and anything written before the ledger recorded `Modified_Time`.
-  Calling those diverged would report a real approval as an ungoverned edit
+- every entry it does have is unmatchable - merges and deletes, neither of
+  which Zoho timestamps in its response, and anything written before the ledger
+  recorded `Modified_Time`. Calling those diverged would report a real approval
+  as an ungoverned edit
 - the record no longer reads back, deleted or merged in the UI
 - `include_ungoverned` was false, in which case the verdict is `unchecked`:
   nothing was read, so nothing is claimed
@@ -1135,7 +1163,9 @@ Per record, in the file, every source merged and ordered:
   chain. The chain rotates at 5000 entries and sealed archives are not read.
 - `unmatchable_ledger_entries` counts approvals with no recorded post-write
   `Modified_Time` that therefore cannot be matched to any record's current
-  state.
+  state. Every governed delete is one of these permanently: Zoho's DELETE
+  response carries no timestamp, so there is never anything to match. The ids
+  are still in the entry, so the delete stays in the record's timeline.
 - `unattributed_refusals` counts refusals recorded before refusals carried
   record ids. They join to nothing, and the count is reported so their absence
   from a record's history is not read as "the control never fired here".
@@ -1211,11 +1241,18 @@ entry has no display name and no deleted-by: for 60 days the ledger entry is the
 more readable of the two records that a delete happened, and after that it is
 the only one.
 
-Zoho's DELETE response has never been captured, so whether it returns a
-post-write `Modified_Time` is unknown. If it does, the entry is matchable like
-any other. If it does not, the entry reports itself as unmatchable rather than
-going quiet - it never silently disappears from both the governed set and the
-unmatchable count.
+**Zoho's DELETE response carries no `Modified_Time`.** Confirmed against a live
+org. The entry is therefore always written with `written: null`, and every
+governed delete is permanently unmatchable: it counts in
+`unmatchable_ledger_entries` in both `scan_changes` and `custody_report`, and it
+can never be matched to a record's current state.
+
+That is the designed outcome rather than a gap. There is nothing to match a
+deleted record against, and an entry that looked matchable but matched nothing
+would make a real approval disappear from the governed set and the unmatchable
+count at the same time. The ids are still recorded, in `targets` and `before`
+with the prior values, so `custody_report` still shows the delete in a record's
+timeline and `plan_rollback` still has what it needs.
 
 ## zoho.apply_handover
 

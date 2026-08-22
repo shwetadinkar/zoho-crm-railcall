@@ -1266,11 +1266,15 @@ def zoho_apply_delete(inputs, stamp):
     # stops coming back from COQL, so nothing scans it - but audit_pack and
     # custody_report both showed the approval as never having happened.
     #
-    # Zoho's DELETE response has never been captured, so whether its SUCCESS
-    # rows carry Modified_Time is unknown. _governed_written decides: with
-    # timestamps the entry is matchable, without them it is reported as
-    # unmatchable rather than disappearing. Either way `targets` and `before`
-    # carry the ids and the prior state.
+    # Zoho's DELETE response carries NO Modified_Time - captured live against a
+    # real org, which is what the fixture note asked for. So _governed_written
+    # returns None here every time and a governed delete is permanently
+    # unmatchable: it counts in unmatchable_ledger_entries and can never join
+    # to a record's current state. That is the designed outcome, not a gap -
+    # an entry that looked matchable and matched nothing is what would make a
+    # real approval vanish from the governed set AND the unmatchable count.
+    # `targets` and `before` still carry the ids and the prior state, so
+    # custody_report finds the delete in a record's timeline regardless.
     entry = _ledger_append(_ledger_note(
         "applied", "apply_delete", module,
         _plan_key("delete:" + module, query, {}),
